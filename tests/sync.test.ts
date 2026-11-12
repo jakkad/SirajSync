@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cleanFolder, createPayload, initialProperties, parseRules, planItem, renderBody, serverOrigin, updateBody, validateBodyTemplate, type Item } from "../src/model.ts";
+import { cleanCoversFolder, cleanFolder, createPayload, initialProperties, parseRules, planItem, renderBody, serverOrigin, updateBody, validateBodyTemplate, type Item } from "../src/model.ts";
 
 const item: Item = {
   id: "01HWWYZ2WDKEVC7JQZJ0AKTH3A", title: "The Dispossessed", contentType: "book",
@@ -144,4 +144,14 @@ test("cover mappings prefer cached files without sending vault links to SirajHub
   const edited = await planItem(downloaded, { ...local, cover: changedUrl }, coverRules, migrated.next);
   assert.deepEqual(edited.writes, { coverUrl: changedUrl });
   assert.throws(() => createPayload("book", local, coverRules, "Book"), /HTTP or HTTPS/);
+
+  const folder = cleanCoversFolder("Attachments/Book Covers/");
+  const movedCover = `[[${folder}/0123456789abcdef/${item.id}.png]]`;
+  const moved = await planItem({ ...downloaded, coverImage: movedCover }, local, coverRules, migrated.next);
+  assert.deepEqual(moved.pulls, { cover: movedCover, "cover-image": movedCover });
+  assert.deepEqual(moved.writes, {});
+  assert.deepEqual((await planItem({ ...online, coverUrl: changedUrl, coverImage: movedCover },
+    { cover: movedCover, "cover-image": movedCover }, coverRules, moved.next)).writes, {});
+  assert.equal(cleanCoversFolder(" "), "SirajHub/Covers");
+  assert.throws(() => cleanCoversFolder("Attachments/[Covers]"), /Obsidian links/);
 });

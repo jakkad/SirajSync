@@ -7,10 +7,9 @@ const imageTypes = {
 export type CoverExtension = (typeof imageTypes)[keyof typeof imageTypes];
 export const coverExtensions: readonly CoverExtension[] = Object.values(imageTypes);
 
-export async function coverFolder(account: string) {
+export async function coverAccountFolder(account: string) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(account));
-  const prefix = Array.from(new Uint8Array(digest).slice(0, 8), (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `SirajHub/Covers/${prefix}`;
+  return Array.from(new Uint8Array(digest).slice(0, 8), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function coverUrl(value: string) {

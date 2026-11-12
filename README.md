@@ -30,7 +30,7 @@ Wrap the property name in double brackets to make its text values Obsidian links
 
 Add `finishedAt = finished-date` to an existing mapping to import the date from SirajHub. It uses the same `YYYY-MM-DD` date as the SirajHub edit form. In Obsidian, set the property type to **Date** for the calendar picker and date comparisons. New default mappings already include it.
 
-Sync downloads covers for eligible items into `SirajHub/Covers/` inside the vault. It reuses existing files and retries missing ones by default. Turn on **Redownload covers on every sync** to refresh existing files. With `coverUrl = cover`, sync updates the `cover` property to link to the local file. If a local copy is unavailable, it uses the source URL. Existing `coverImage` mappings continue to work as local file links.
+Set **Covers folder** to choose where sync stores covers inside your vault. The default is `SirajHub/Covers`, with a subfolder for each connected account. After you change the folder, sync copies cached covers to the new location and keeps the old copies for any other notes that link to them. Sync retries missing images by default. Turn on **Redownload covers on every sync** to refresh existing files. With `coverUrl = cover`, sync updates the `cover` property to link to the local file. If a local copy is unavailable, it uses the source URL. Existing `coverImage` mappings continue to work as local file links.
 
 Clear a folder to skip that content type. Folder changes apply to future imports. Move or rename linked notes in Obsidian with Siraj Sync enabled so it can update the stored paths. When an older note syncs, the plugin moves its link into plugin data, removes the two sync properties, and strips the old item ID suffix from its filename.
 

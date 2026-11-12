@@ -1,7 +1,7 @@
 {
   "id": "siraj-sync",
   "name": "Siraj Sync",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "minAppVersion": "1.11.5",
   "description": "Sync your SirajHub library with configurable folders and note properties.",
   "author": "SirajHub",

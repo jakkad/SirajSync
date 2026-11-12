@@ -3,10 +3,10 @@ import {
   SecretComponent, Setting, stringifyYaml, TFile, TFolder,
 } from "obsidian";
 import { SirajApi } from "./api.ts";
-import { coverExtensions, coverFolder, downloadCover, type CoverExtension } from "./covers.ts";
+import { coverAccountFolder, coverExtensions, downloadCover, type CoverExtension } from "./covers.ts";
 import { SyncProgress } from "./progress.ts";
 import {
-  ACCOUNT, cleanFolder, createPayload, defaults, ID, initialProperties, isStatus, isType, KEY,
+  ACCOUNT, cleanCoversFolder, cleanFolder, createPayload, DEFAULT_COVERS_FOLDER, defaults, ID, initialProperties, isStatus, isType, KEY,
   parseRules, planItem, renderBody, serverOrigin, stable, STATUSES, statusIds, TYPES, ULID, updateBody, validateBodyTemplate,
   type Baseline, type ContentType, type Item, type Properties, type Resolution, type Settings,
 } from "./model.ts";
@@ -18,9 +18,10 @@ type SyncData = {
   links: Record<string, Link>;
   managedProperties: Record<string, string[]>;
   covers: Record<string, CoverExtension>;
+  previousCoverRoots: string[];
 };
 type Report = { created: number; pulled: number; pushed: number; unchanged: number; issues: string[] };
-type CoverSettings = { folder: string; refresh: boolean; progress: SyncProgress };
+type CoverSettings = { folder: string; previousFolders: string[]; refresh: boolean; progress: SyncProgress };
 const typeIds = Object.keys(TYPES) as ContentType[];
 
 function baselineProperty(mapping: string) {
@@ -94,6 +95,7 @@ export default class SirajSync extends Plugin {
       links: stored?.links ?? {},
       managedProperties: stored?.managedProperties ?? {},
       covers: stored?.covers ?? {},
+      previousCoverRoots: stored?.previousCoverRoots ?? [],
     };
     for (const type of typeIds) {
       Object.assign(this.data.settings.types[type], stored?.settings?.types?.[type]);
@@ -152,6 +154,12 @@ export default class SirajSync extends Plugin {
     if (this.running) throw Error("Wait for the current sync to finish before saving settings.");
     if (!next.statuses.length) throw Error("Select at least one status to sync.");
     if (next.server) this.connectionOrigin(next);
+    next.coversFolder = cleanCoversFolder(next.coversFolder);
+    const previousFolder = this.data.settings.coversFolder;
+    if (previousFolder !== next.coversFolder) {
+      this.data.previousCoverRoots = [...new Set([previousFolder, ...this.data.previousCoverRoots])]
+        .filter((folder) => folder !== next.coversFolder);
+    }
     this.data.settings = next;
     this.lastAutomatic = Date.now();
     await this.save();
@@ -269,24 +277,24 @@ export default class SirajSync extends Plugin {
   private async withCover(item: Item, account: string, covers: CoverSettings, result: Report): Promise<Item> {
     if (typeof item.coverUrl !== "string" || !item.coverUrl.trim()) return { ...item, coverImage: null };
     const key = `${account}/${item.id}`;
-    const path = (extension: CoverExtension) => `${covers.folder}/${item.id}.${extension}`;
+    const path = (folder: string, extension: CoverExtension) => `${folder}/${item.id}.${extension}`;
     const known = this.data.covers[key];
     const candidates = known && coverExtensions.includes(known) ? [known] : coverExtensions;
-    let file: TFile | null = null;
-    for (const extension of candidates) {
-      const candidate = this.app.vault.getFileByPath(path(extension));
-      if (!candidate?.stat.size) continue;
-      file = candidate;
-      this.data.covers[key] = extension;
-      break;
-    }
-    if (!file || covers.refresh) {
-      covers.progress.update(`Downloading cover for “${item.title}”…`);
+    const cached = [covers.folder, ...covers.previousFolders].flatMap((folder) =>
+      candidates.map((extension) => ({ folder, extension, file: this.app.vault.getFileByPath(path(folder, extension)) })))
+      .find(({ file }) => file?.stat.size);
+    let file = cached?.file ?? null;
+    if (cached) this.data.covers[key] = cached.extension;
+    if (!file || covers.refresh || cached?.folder !== covers.folder) {
+      const copy = file && cached && !covers.refresh ? { file, extension: cached.extension } : null;
+      covers.progress.update(`${copy ? "Copying" : "Downloading"} cover for “${item.title}”…`);
       try {
-        const { extension, data } = await downloadCover(item.coverUrl);
+        const { extension, data } = copy
+          ? { extension: copy.extension, data: await this.app.vault.readBinary(copy.file) }
+          : await downloadCover(item.coverUrl);
         if (!this.loaded) return item;
         await this.ensureFolder(covers.folder);
-        const destination = path(extension);
+        const destination = path(covers.folder, extension);
         const existing = this.app.vault.getFileByPath(destination);
         if (existing) {
           await this.app.vault.modifyBinary(existing, data);
@@ -421,7 +429,12 @@ export default class SirajSync extends Plugin {
     const account = await api.account();
     progress.update("Loading the SirajHub library and checking vault notes…");
     const [items, links] = await Promise.all([api.items(), this.linkedNotes(account)]);
-    const covers = { folder: await coverFolder(account), refresh: settings.refreshCovers, progress };
+    const coverScope = await coverAccountFolder(account);
+    const covers = {
+      folder: `${settings.coversFolder}/${coverScope}`,
+      previousFolders: this.data.previousCoverRoots.map((folder) => `${folder}/${coverScope}`),
+      refresh: settings.refreshCovers, progress,
+    };
     const result: Report = { created: 0, pulled: 0, pushed: 0, unchanged: 0, issues: [] };
     const remoteIds = new Set(items.map(({ id }) => id));
     const targets = only ? items.filter(({ id }) => links.get(id)?.includes(only)) : items;
@@ -605,6 +618,10 @@ class SyncSettings extends PluginSettingTab {
       .setDesc("Refresh saved cover images. When off, sync downloads a cover only if its local file is missing.")
       .addToggle((toggle) => toggle.setValue(draft.refreshCovers)
         .onChange((enabled) => { draft.refreshCovers = enabled; }));
+    new Setting(containerEl).setName("Covers folder")
+      .setDesc("Folder inside this vault. Leave blank to use SirajHub/Covers.")
+      .addText((input) => input.setPlaceholder(DEFAULT_COVERS_FOLDER).setValue(draft.coversFolder)
+        .onChange((value) => { draft.coversFolder = value; }));
 
     new Setting(containerEl).setName("Statuses to sync").setHeading();
     containerEl.createEl("p", { text: "Select at least one SirajHub status. Items with other statuses are skipped, and their existing notes stay in your vault." });

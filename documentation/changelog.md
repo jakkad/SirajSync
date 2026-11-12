@@ -25,3 +25,7 @@
 ## 0.1.9 — November 12, 2026
 
 - Existing mappings such as `coverUrl = cover` now point to the downloaded cover in the vault. Sync reuses covers already saved and falls back to the source URL if a local copy is unavailable. SirajHub continues to store the source URL.
+
+## 0.1.10 — November 12, 2026
+
+- Added **Covers folder** to choose where Siraj Sync stores cover images in the vault. Leave it blank to use `SirajHub/Covers`. When the folder changes, the next sync copies cached covers to the new folder and updates links in synced notes. The original files stay available to other notes that link to them.

@@ -7,6 +7,7 @@ export const ID = "sirajhub-id";
 export const ACCOUNT = "sirajhub-account";
 export const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 export const KEY = /^srj_sync_[a-f0-9]{64}$/;
+export const DEFAULT_COVERS_FOLDER = "SirajHub/Covers";
 export const STATUSES = {
   suggestions: "Suggestions", in_progress: "In progress", finished: "Finished", archived: "Archived",
 } as const;
@@ -23,6 +24,7 @@ export type Settings = {
   server: string;
   secret: string;
   interval: number;
+  coversFolder: string;
   refreshCovers: boolean;
   removeUnmappedProperties: boolean;
   statuses: ItemStatus[];
@@ -46,7 +48,8 @@ const EXTRAS: Record<ContentType, string> = {
 
 export function defaults(): Settings {
   return {
-    server: "", secret: "", interval: 0, refreshCovers: false, removeUnmappedProperties: false, statuses: [...statusIds],
+    server: "", secret: "", interval: 0, coversFolder: DEFAULT_COVERS_FOLDER,
+    refreshCovers: false, removeUnmappedProperties: false, statuses: [...statusIds],
     types: Object.fromEntries(Object.entries(TYPES).map(([type, label]) => [
       type, { folder: `SirajHub/${label}`, properties: `${COMMON}\n${EXTRAS[type as ContentType]}`, body: "" },
     ])) as Settings["types"],
@@ -138,6 +141,12 @@ export function cleanFolder(value: string): string {
   if (value.trim() && (!folder || folder.split("/").some((part) => !part.trim() || part.startsWith(".") || /[\\:*?"<>|\u0000-\u001f]/.test(part)))) {
     throw Error("Enter a folder inside the vault, such as SirajHub/Books.");
   }
+  return folder;
+}
+
+export function cleanCoversFolder(value: string): string {
+  const folder = cleanFolder(value) || DEFAULT_COVERS_FOLDER;
+  if (/[\[\]#^]|%%/.test(folder)) throw Error("The covers folder name must work in Obsidian links. Remove brackets, #, ^, or %%.");
   return folder;
 }
 
@@ -234,7 +243,7 @@ function unlinkValue(value: unknown): unknown {
 
 function savedCoverLink(value: unknown, id: string) {
   if (typeof value !== "string") return false;
-  const match = /^\[\[SirajHub\/Covers\/[a-f0-9]{16}\/([0-9A-HJKMNP-TV-Z]{26})\.[a-z0-9]+\]\]$/.exec(value);
+  const match = /^\[\[[^\[\]\r\n]+\/[a-f0-9]{16}\/([0-9A-HJKMNP-TV-Z]{26})\.[a-z0-9]+\]\]$/.exec(value);
   return match?.[1] === id;
 }
 
