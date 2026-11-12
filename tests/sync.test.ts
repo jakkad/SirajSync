@@ -68,3 +68,54 @@ test("body templates render unmapped metadata and refresh only their own section
   assert.equal(updateBody(refreshed, "", "\r\n"), original + "\r\n\r\nAnother personal note.");
   assert.throws(() => updateBody("<!-- siraj-sync:body -->\nMy notes", "", "\n"), /incomplete/);
 });
+
+test("linked mappings convert existing text and send edited link values as plain text", async () => {
+  const book = { ...item, creator: "Ursula K. Le Guin" };
+  const plainRules = parseRules("creator = author", "book");
+  const linkRules = parseRules("creator = [[author]]\nmetadata.genres = [[genres]]", "book");
+  const plain = initialProperties(book, plainRules);
+  const base = (await planItem(book, plain, plainRules, {})).next;
+  const linked = initialProperties(book, linkRules);
+  assert.deepEqual(linked, { author: "[[Ursula K. Le Guin]]", genres: ["[[science fiction]]"] });
+  assert.throws(() => parseRules("creator = [[author", "book"), /field = property/);
+  assert.throws(() => parseRules("creator = [[author]]\ntitle = Author", "book"), /Duplicate/);
+
+  const converted = await planItem(book, plain, linkRules, base);
+  assert.deepEqual(converted.writes, {});
+  assert.deepEqual(converted.pulls, linked);
+  const custom = { ...linked, author: "[[Authors/Le Guin|Ursula K. Le Guin]]" };
+  const unchanged = await planItem(book, custom, linkRules, converted.next);
+  assert.deepEqual(unchanged.writes, {});
+  assert.deepEqual(unchanged.pulls, {});
+  const edited = { ...linked, author: "[[Authors/Butler|Octavia E. Butler]]" };
+  const changed = await planItem(book, edited, linkRules, converted.next);
+  assert.deepEqual(changed.writes, { creator: "Octavia E. Butler" });
+  assert.equal(createPayload("book", edited, linkRules, "Book").creator, "Octavia E. Butler");
+  const pulled = await planItem({ ...book, creator: "Samuel R. Delany" }, linked, linkRules, converted.next);
+  assert.deepEqual(pulled.pulls, { author: "[[Samuel R. Delany]]" });
+  const reverted = await planItem(book, linked, plainRules, converted.next);
+  assert.deepEqual(reverted.writes, {});
+  assert.deepEqual(reverted.pulls, plain);
+});
+
+test("finished dates import as calendar dates and migrate old timestamps", async () => {
+  const timestamp = Date.parse("2026-11-12T23:30:00Z");
+  const book = { ...item, finishedAt: timestamp };
+  const dateRules = parseRules("finishedAt = finished-date", "book");
+  const date = { "finished-date": "2026-11-12" };
+  assert.deepEqual(initialProperties(book, dateRules), date);
+  assert.deepEqual(initialProperties(item, dateRules), {});
+  assert.equal(renderBody("Finished {{finishedAt}}", book), "Finished 2026-11-12");
+  assert.deepEqual(createPayload("book", date, dateRules, "Book"), { contentType: "book", title: "Book" });
+
+  const legacy = { "finished-date": timestamp };
+  const legacyHash = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(timestamp)))).toString("hex");
+  const base = { "finishedAt=finished-date": legacyHash };
+  const migrated = await planItem(book, legacy, dateRules, base);
+  assert.deepEqual(migrated.pulls, date);
+  assert.deepEqual(migrated.writes, {});
+  assert.deepEqual((await planItem({ ...book, finishedAt: timestamp + 86_400_000 }, legacy, dateRules, base)).pulls,
+    { "finished-date": "2026-11-13" });
+  assert.deepEqual((await planItem(item, legacy, dateRules, base)).pulls, { "finished-date": null });
+  assert.deepEqual((await planItem(book, date, dateRules, migrated.next)).pulls, {});
+});

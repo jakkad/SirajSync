@@ -10,9 +10,18 @@ import {
 } from "./model.ts";
 
 type Link = { account: string; id: string };
-type SyncData = { settings: Settings; baselines: Record<string, Baseline>; links: Record<string, Link> };
+type SyncData = {
+  settings: Settings;
+  baselines: Record<string, Baseline>;
+  links: Record<string, Link>;
+  managedProperties: Record<string, string[]>;
+};
 type Report = { created: number; pulled: number; pushed: number; unchanged: number; issues: string[] };
 const typeIds = Object.keys(TYPES) as ContentType[];
+
+function baselineProperty(mapping: string) {
+  return mapping.slice(mapping.indexOf("=") + 1);
+}
 
 function frontmatterBlock(text: string) {
   const offset = text.startsWith("\uFEFF") ? 1 : 0;
@@ -78,6 +87,7 @@ export default class SirajSync extends Plugin {
       settings: { ...base, ...stored?.settings, types: { ...base.types } },
       baselines: stored?.baselines ?? {},
       links: stored?.links ?? {},
+      managedProperties: stored?.managedProperties ?? {},
     };
     for (const type of typeIds) {
       Object.assign(this.data.settings.types[type], stored?.settings?.types?.[type]);
@@ -247,22 +257,32 @@ export default class SirajSync extends Plugin {
     const path = this.availablePath(`${config.folder}/${safeFilename(item.title)}`);
     const file = await this.app.vault.create(path, withBody(withProperties("", props), config.body, item));
     this.data.links[file.path] = { account, id: item.id };
-    this.data.baselines[`${account}/${item.id}`] = next;
+    const key = `${account}/${item.id}`;
+    delete this.data.managedProperties[key];
+    this.data.baselines[key] = next;
     await this.save();
   }
 
   private async reconcile(
     api: SirajApi, file: TFile, item: Item, account: string, config: Settings["types"][ContentType], result: Report,
-    resolution: Resolution = "normal",
+    resolution: Resolution, syncValues: boolean, removeUnmappedProperties: boolean,
   ) {
     const rules = parseRules(config.properties, item.contentType);
-    const raw = await this.app.vault.read(file);
-    const local = properties(raw);
-    const link = this.data.links[file.path];
-    if (link?.id !== item.id || link.account !== account) throw Error("This note’s SirajHub link changed.");
     const key = `${account}/${item.id}`;
     const previous = this.data.baselines[key] ?? {};
-    let plan = await planItem(item, local, rules, previous, resolution);
+    // Older installs already recorded the property names in their sync baselines.
+    const managed = this.data.managedProperties[key] ?? Object.keys(previous).map(baselineProperty);
+    const mapped = new Set(rules.map(({ property }) => property));
+    const removed = new Set(removeUnmappedProperties ? managed.filter((property) => !mapped.has(property)) : []);
+    if (!syncValues && !removed.size) return;
+
+    const raw = await this.app.vault.read(file);
+    const local = properties(raw);
+    const link = this.data.links[file.path] ?? this.legacyLink(raw, file.path);
+    if (link?.id !== item.id || link.account !== account) throw Error("This note’s SirajHub link changed.");
+    let plan = syncValues
+      ? await planItem(item, local, rules, previous, resolution)
+      : { writes: {}, pulls: {}, next: { ...previous }, problems: [] };
     let wrote = false;
 
     if (Object.keys(plan.writes).length && this.loaded) {
@@ -275,22 +295,33 @@ export default class SirajSync extends Plugin {
       plan = await planItem(item, local, rules, previous, resolution, payload);
     }
 
+    if (!this.loaded) return;
     const next = { ...local };
+    for (const property of removed) delete next[property];
     for (const [property, value] of Object.entries(plan.pulls)) {
       if (value == null) delete next[property];
       else next[property] = value;
     }
-    const updated = withBody(Object.keys(plan.pulls).length ? withProperties(raw, next) : raw, config.body, item);
-    if (updated !== raw && this.loaded) {
+    const changedProperties = Object.keys(plan.pulls).length > 0 || [...removed].some((property) => Object.hasOwn(local, property));
+    const note = changedProperties ? withProperties(raw, next) : raw;
+    const updated = syncValues ? withBody(note, config.body, item) : note;
+    if (updated !== raw) {
       await this.app.vault.process(file, (current) => {
         if (current !== raw) throw Error("The note changed during sync. Run sync again.");
         return updated;
       });
       result.pulled++;
-    } else if (!wrote && !plan.problems.length) {
+    } else if (syncValues && !wrote && !plan.problems.length) {
       result.unchanged++;
     }
     for (const problem of plan.problems) result.issues.push(`${file.path}: ${problem}`);
+    const retained = new Set(managed.filter((property) => !removed.has(property)));
+    for (const mapping of Object.keys(plan.next)) {
+      const property = baselineProperty(mapping);
+      if (removed.has(property)) delete plan.next[mapping];
+      else retained.add(property);
+    }
+    this.data.managedProperties[key] = [...retained];
     this.data.baselines[key] = plan.next;
   }
 
@@ -308,19 +339,20 @@ export default class SirajSync extends Plugin {
         const config = settings.types[item.contentType];
         const notes = links.get(item.id) ?? [];
         if (only && !notes.includes(only)) continue;
-        if (!isStatus(item.status) || !settings.statuses.includes(item.status)) {
+        const selected = isStatus(item.status) && settings.statuses.includes(item.status);
+        const syncValues = selected && Boolean(config.folder);
+        if (!selected) {
           if (only) result.issues.push(`${only.path}: the item's SirajHub status is not selected for sync.`);
-          continue;
-        }
-        if (!config.folder) {
+        } else if (!config.folder) {
           if (only) result.issues.push(`${only.path}: sync is disabled for ${TYPES[item.contentType]}.`);
-          continue;
         }
+        if (!syncValues && (!settings.removeUnmappedProperties || !notes.length)) continue;
         try {
           if (notes.length > 1) throw Error(`More than one note links to this item: ${notes.map((file) => file.path).join(", ")}.`);
-          if (notes[0]) await this.migrateLink(notes[0], { account, id: item.id });
-          if (notes[0]) await this.reconcile(api, notes[0], item, account, config, result, resolution);
-          else {
+          if (notes[0]) {
+            if (syncValues) await this.migrateLink(notes[0], { account, id: item.id });
+            await this.reconcile(api, notes[0], item, account, config, result, resolution, syncValues, settings.removeUnmappedProperties);
+          } else {
             await this.importItem(item, account, config);
             result.created++;
           }
@@ -491,6 +523,10 @@ class SyncSettings extends PluginSettingTab {
     }
 
     new Setting(containerEl).setName("Library folders and note content").setHeading();
+    new Setting(containerEl).setName("Remove properties when mappings are removed")
+      .setDesc("Delete previously synced properties from linked notes when their mappings are removed, even if the item is excluded from regular sync.")
+      .addToggle((toggle) => toggle.setValue(draft.removeUnmappedProperties)
+        .onChange((enabled) => { draft.removeUnmappedProperties = enabled; }));
     containerEl.createEl("p", { text: "Clear a folder to skip that type. Use one field = property mapping per line. Fields starting with metadata. are imported from SirajHub. Changes to folders affect new imports; linked notes stay where you put them." });
     for (const type of typeIds) {
       const details = containerEl.createEl("details");
@@ -498,11 +534,13 @@ class SyncSettings extends PluginSettingTab {
       const config = draft.types[type];
       new Setting(details).setName("Folder").addText((input) => input.setValue(config.folder)
         .onChange((value) => { config.folder = value; }));
-      new Setting(details).setName("Property mappings").addTextArea((input) => {
-        input.inputEl.rows = 9;
-        input.inputEl.cols = 32;
-        input.setValue(config.properties).onChange((value) => { config.properties = value; });
-      });
+      new Setting(details).setName("Property mappings")
+        .setDesc("Use creator = [[author]] to link the value in the author property.")
+        .addTextArea((input) => {
+          input.inputEl.rows = 9;
+          input.inputEl.cols = 32;
+          input.setValue(config.properties).onChange((value) => { config.properties = value; });
+        });
       new Setting(details).setName("Note body template")
         .setDesc("Optional Markdown. Use {{creator}}, {{description}}, or {{metadata.genres}} to insert SirajHub values.")
         .addTextArea((input) => {

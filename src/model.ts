@@ -18,11 +18,12 @@ const READ_ONLY = [
   "contentType", "subtitle", "progressPercent", "progressCurrent", "progressTotal",
   "createdAt", "updatedAt", "startedAt", "finishedAt", "lastTouchedAt",
 ];
-type Rule = { field: string; property: string; writable: boolean };
+type Rule = { field: string; property: string; writable: boolean; wikilink: boolean };
 export type Settings = {
   server: string;
   secret: string;
   interval: number;
+  removeUnmappedProperties: boolean;
   statuses: ItemStatus[];
   types: Record<ContentType, { folder: string; properties: string; body: string }>;
 };
@@ -31,7 +32,7 @@ export type Properties = Record<string, unknown>;
 export type Baseline = Record<string, string>;
 export type Resolution = "normal" | "pull" | "push";
 
-const COMMON = "title = title\ncreator = creator\nstatus = siraj-status\nrating = siraj-rating\nsourceUrl = source\ncoverUrl = cover\nreleaseDate = release-date\ndescription = description\nnotes = siraj-notes";
+const COMMON = "title = title\ncreator = creator\nstatus = siraj-status\nfinishedAt = finished-date\nrating = siraj-rating\nsourceUrl = source\ncoverUrl = cover\nreleaseDate = release-date\ndescription = description\nnotes = siraj-notes";
 const EXTRAS: Record<ContentType, string> = {
   book: "pageCount = pages\nmetadata.isbn = isbn\nmetadata.genres = genres",
   movie: "durationMins = runtime\nmetadata.genres = genres",
@@ -44,7 +45,7 @@ const EXTRAS: Record<ContentType, string> = {
 
 export function defaults(): Settings {
   return {
-    server: "", secret: "", interval: 0, statuses: [...statusIds],
+    server: "", secret: "", interval: 0, removeUnmappedProperties: false, statuses: [...statusIds],
     types: Object.fromEntries(Object.entries(TYPES).map(([type, label]) => [
       type, { folder: `SirajHub/${label}`, properties: `${COMMON}\n${EXTRAS[type as ContentType]}`, body: "" },
     ])) as Settings["types"],
@@ -62,10 +63,14 @@ export function parseRules(text: string, type: ContentType): Rule[] {
   const properties = new Set([ID, ACCOUNT, "__proto__", "constructor", "prototype", "position"]);
   return text.split(/\r?\n/).flatMap((line, index) => {
     if (!line.trim()) return [];
-    const match = /^\s*([\w.]+)\s*=\s*([\p{L}\p{N}_][\p{L}\p{M}\p{N}_. -]*)$/u.exec(line.trim());
-    if (!match) throw Error(`Line ${index + 1}: use field = property.`);
+    const match = /^([\w.]+)\s*=\s*(.+)$/u.exec(line.trim());
+    const target = match?.[2] ?? "";
+    const wikilink = target.startsWith("[[") && target.endsWith("]]");
+    const property = wikilink ? target.slice(2, -2).trim() : target;
+    if (!match || !/^[\p{L}\p{N}_][\p{L}\p{M}\p{N}_. -]*$/u.test(property)) {
+      throw Error(`Line ${index + 1}: use field = property or field = [[property]].`);
+    }
     const field = match[1]!;
-    const property = match[2]!;
     const writable = TEXT.includes(field) || NUMBERS.includes(field);
     if (!supportsField(field, type)) {
       throw Error(`Unsupported field: ${field}.`);
@@ -75,7 +80,7 @@ export function parseRules(text: string, type: ContentType): Rule[] {
     }
     keys.add(field);
     properties.add(property.toLowerCase());
-    return [{ field, property, writable }];
+    return [{ field, property, writable, wikilink }];
   });
 }
 
@@ -143,7 +148,14 @@ export function isStatus(value: unknown): value is ItemStatus {
   return typeof value === "string" && Object.hasOwn(STATUSES, value);
 }
 
+function finishedDate(value: unknown): unknown {
+  if (typeof value !== "number") return value;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString().slice(0, 10) : null;
+}
+
 function valueAt(item: Item, field: string) {
+  if (field === "finishedAt") return finishedDate(item.finishedAt ?? null);
   if (!field.startsWith("metadata.")) return item[field] ?? null;
   let data: unknown = item.metadata;
   if (typeof data === "string") {
@@ -200,16 +212,32 @@ function validatedValue(field: string, value: unknown): unknown {
   return value;
 }
 
+function linkValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(linkValue);
+  if (typeof value !== "string" || !value || value !== value.trim() || /[\[\]|#^:\r\n]|%%/.test(value)) return value;
+  return `[[${value}]]`;
+}
+
+function unlinkValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(unlinkValue);
+  if (typeof value !== "string") return value;
+  const match = /^\[\[([^\[\]|\r\n]+)(?:\|([^\[\]|\r\n]+))?\]\]$/.exec(value);
+  return match ? (match[2] ?? match[1])!.trim() : value;
+}
+
 export function initialProperties(item: Item, rules: Rule[]): Properties {
-  return Object.fromEntries(rules.map(({ field, property }) => [property, valueAt(item, field)])
+  return Object.fromEntries(rules.map(({ field, property, wikilink }) => {
+    const value = valueAt(item, field);
+    return [property, wikilink ? linkValue(value) : value];
+  })
     .filter(([, value]) => value != null));
 }
 
 export function createPayload(type: ContentType, props: Properties, rules: Rule[], filename: string) {
   const values: Properties = { contentType: type, title: validatedValue("title", filename) };
-  for (const { field, property, writable } of rules) {
+  for (const { field, property, writable, wikilink } of rules) {
     if (writable && Object.hasOwn(props, property) && props[property] != null && props[property] !== "") {
-      values[field] = validatedValue(field, props[property]);
+      values[field] = validatedValue(field, wikilink ? unlinkValue(props[property]) : props[property]);
     }
   }
   return values;
@@ -223,16 +251,26 @@ export async function planItem(
   const next: Baseline = {};
   const problems: string[] = [];
 
-  await Promise.all(rules.map(async ({ field, property, writable }) => {
-    const key = `${field}=${property}`;
+  await Promise.all(rules.map(async ({ field, property, writable, wikilink }) => {
+    const plainKey = `${field}=${property}`;
+    const linkKey = `link:${plainKey}`;
+    const key = wikilink ? linkKey : plainKey;
+    const wasLinked = Object.hasOwn(previous, linkKey);
+    const base = previous[key] ?? previous[wikilink ? plainKey : linkKey];
     const remote = valueAt(item, field);
-    const current = Object.hasOwn(local, property) ? local[property] : null;
+    const localValue = Object.hasOwn(local, property) ? local[property] : null;
+    const localDisplay = field === "finishedAt" ? finishedDate(localValue) : localValue;
+    const current = (wikilink || wasLinked) && stable(localDisplay) !== stable(remote) ? unlinkValue(localDisplay) : localDisplay;
     const [localHash, remoteHash] = await Promise.all([fingerprint(current), fingerprint(remote)]);
-    const base = previous[key];
+    // Older versions stored and hashed finishedAt as a millisecond timestamp.
+    const legacyDate = base && field === "finishedAt" && typeof localValue === "number" && localHash !== base;
+    const matchesBase = localHash === base || (legacyDate && await fingerprint(localValue) === base);
     if (localHash === remoteHash) {
+      const formatted = wikilink ? linkValue(localDisplay) : current;
+      if (stable(formatted) !== stable(localValue)) pulls[property] = formatted;
       next[key] = remoteHash;
-    } else if (resolution === "pull" || Object.hasOwn(accepted, field) || (base ? localHash === base : !Object.hasOwn(local, property))) {
-      pulls[property] = remote;
+    } else if (resolution === "pull" || Object.hasOwn(accepted, field) || (base ? matchesBase : !Object.hasOwn(local, property))) {
+      pulls[property] = wikilink ? linkValue(remote) : remote;
       next[key] = remoteHash;
     } else if (writable && (resolution === "push" || (base && remoteHash === base))) {
       try { writes[field] = validatedValue(field, current); }

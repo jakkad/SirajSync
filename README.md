@@ -17,13 +17,20 @@ Expand each content type in the plugin settings to set its vault folder and map 
 
 ```text
 title = title
-creator = author
+creator = [[author]]
+finishedAt = finished-date
 rating = my-rating
 pageCount = pages
 metadata.isbn = isbn
 ```
 
+Wrap the property name in double brackets to make its text values Obsidian links. For example, `creator = [[author]]` writes `author: "[[Ursula K. Le Guin]]"`. Existing synced values change format on the next sync. Editing a linked value sends the link target text or its alias to SirajHub as plain text. The plugin writes links to note names, and you can create missing target notes from Obsidian.
+
+Add `finishedAt = finished-date` to an existing mapping to import the date from SirajHub. It uses the same `YYYY-MM-DD` date as the SirajHub edit form. In Obsidian, set the property type to **Date** for the calendar picker and date comparisons. New default mappings already include it.
+
 Clear a folder to skip that content type. Folder changes apply to future imports. Move or rename linked notes in Obsidian with Siraj Sync enabled so it can update the stored paths. When an older note syncs, the plugin moves its link into plugin data, removes the two sync properties, and strips the old item ID suffix from its filename.
+
+Enable **Remove properties when mappings are removed** to apply mapping removals to existing linked notes on the next sync. For example, removing `status = siraj-status` deletes the previously synced `siraj-status` property. Cleanup also applies to linked notes for excluded statuses and disabled content types. It uses each note’s recorded sync history, so it can only remove properties the plugin still has a record of syncing.
 
 - Editable fields: `title`, `creator`, `status`, `rating`, `description`, `sourceUrl`, `coverUrl`, `releaseDate`, `externalId`, `notes`, `durationMins`, and `pageCount` (books only). Ratings run from 1 to 7. Status values are `suggestions`, `in_progress`, `finished`, and `archived`.
 - Import fields: `metadata.<field>` (for example, `metadata.genres` or `metadata.seasons`), `contentType`, `subtitle`, `progressPercent`, `progressCurrent`, `progressTotal`, `createdAt`, `updatedAt`, `startedAt`, `finishedAt`, and `lastTouchedAt`. Nested objects are represented as JSON strings.
