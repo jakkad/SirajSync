@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cleanFolder, createPayload, initialProperties, parseRules, planItem, serverOrigin, type Item } from "../src/model.ts";
+import { cleanFolder, createPayload, initialProperties, parseRules, planItem, renderBody, serverOrigin, updateBody, validateBodyTemplate, type Item } from "../src/model.ts";
 
 const item: Item = {
   id: "01HWWYZ2WDKEVC7JQZJ0AKTH3A", title: "The Dispossessed", contentType: "book",
@@ -53,4 +53,18 @@ test("publishing sends only mapped writable properties, preserving the file name
     contentType: "book", title: "My book", rating: 7,
   });
   assert.throws(() => createPayload("book", { score: 8 }, rules, "My book"), /1 to 7/);
+});
+
+test("body templates render unmapped metadata and refresh only their own section", () => {
+  const template = "## About\n\nGenres: {{ metadata.genres }}\n\n{{description}}";
+  validateBodyTemplate(template, "book");
+  assert.throws(() => validateBodyTemplate("{{pageCount}}", "movie"), /Unsupported body field/);
+  const original = "Personal notes\r\n";
+  const first = updateBody(original, renderBody(template, item), "\r\n");
+  assert.match(first, /Genres: science fiction\r\n\r\nFirst edition/);
+  const edited = first + "\r\n\r\nAnother personal note.";
+  const refreshed = updateBody(edited, renderBody(template, { ...item, description: "Second edition" }), "\r\n");
+  assert.equal(refreshed, edited.replace("First edition", "Second edition"));
+  assert.equal(updateBody(refreshed, "", "\r\n"), original + "\r\n\r\nAnother personal note.");
+  assert.throws(() => updateBody("<!-- siraj-sync:body -->\nMy notes", "", "\n"), /incomplete/);
 });

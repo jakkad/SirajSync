@@ -5,11 +5,12 @@ import {
 import { SirajApi } from "./api.ts";
 import {
   ACCOUNT, cleanFolder, createPayload, defaults, ID, initialProperties, isStatus, isType, KEY,
-  parseRules, planItem, serverOrigin, stable, STATUSES, statusIds, TYPES, ULID,
+  parseRules, planItem, renderBody, serverOrigin, stable, STATUSES, statusIds, TYPES, ULID, updateBody, validateBodyTemplate,
   type Baseline, type ContentType, type Item, type Properties, type Resolution, type Settings,
 } from "./model.ts";
 
-type SyncData = { settings: Settings; baselines: Record<string, Baseline> };
+type Link = { account: string; id: string };
+type SyncData = { settings: Settings; baselines: Record<string, Baseline>; links: Record<string, Link> };
 type Report = { created: number; pulled: number; pushed: number; unchanged: number; issues: string[] };
 const typeIds = Object.keys(TYPES) as ContentType[];
 
@@ -37,9 +38,19 @@ function withProperties(text: string, props: Properties): string {
   const block = frontmatterBlock(text);
   const body = text.slice(block.contentStart);
   const bom = text.startsWith("\uFEFF") ? "\uFEFF" : "";
+  if (!Object.keys(props).length) return bom + body;
   const newline = text.includes("\r\n") ? "\r\n" : "\n";
   const frontmatter = `---\n${stringifyYaml(props).trimEnd()}\n---\n`.replaceAll("\n", newline);
   return bom + frontmatter + body;
+}
+
+function withBody(text: string, template: string, item: Item) {
+  const { contentStart, exists } = frontmatterBlock(text);
+  const newline = text.includes("\r\n") ? "\r\n" : "\n";
+  const body = updateBody(text.slice(contentStart), renderBody(template, item), newline);
+  const prefix = text.slice(0, contentStart);
+  const separator = exists && body && !prefix.endsWith("\n") ? newline : "";
+  return prefix + separator + body;
 }
 
 function message(error: unknown) {
@@ -64,10 +75,16 @@ export default class SirajSync extends Plugin {
     const stored = await this.loadData() as Partial<SyncData> | null;
     const base = defaults();
     this.data = {
-      settings: { ...base, ...stored?.settings, types: { ...base.types, ...stored?.settings?.types } },
+      settings: { ...base, ...stored?.settings, types: { ...base.types } },
       baselines: stored?.baselines ?? {},
+      links: stored?.links ?? {},
     };
+    for (const type of typeIds) {
+      Object.assign(this.data.settings.types[type], stored?.settings?.types?.[type]);
+    }
     this.loaded = true;
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.moveLinks(oldPath, file.path)));
+    this.registerEvent(this.app.vault.on("delete", (file) => this.moveLinks(file.path)));
     this.addSettingTab(new SyncSettings(this.app, this));
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.sync() });
     this.addCommand({ id: "publish-note", name: "Publish current note to SirajHub", callback: () => void this.publish() });
@@ -91,6 +108,17 @@ export default class SirajSync extends Plugin {
     const task = this.saving.catch(() => undefined).then(() => this.saveData(snapshot));
     this.saving = task;
     return task;
+  }
+
+  private moveLinks(oldPath: string, newPath?: string) {
+    let changed = false;
+    for (const [path, link] of Object.entries(this.data.links)) {
+      if (path !== oldPath && !path.startsWith(`${oldPath}/`)) continue;
+      delete this.data.links[path];
+      if (newPath !== undefined) this.data.links[newPath + path.slice(oldPath.length)] = link;
+      changed = true;
+    }
+    if (changed) void this.save().catch((error) => new Notice(`Siraj Sync: ${message(error)}`, 8000));
   }
 
   async updateSettings(next: Settings) {
@@ -139,28 +167,65 @@ export default class SirajSync extends Plugin {
     const found = new Map<string, TFile[]>();
     for (const file of this.app.vault.getMarkdownFiles()) {
       if (!this.loaded) break;
-      const raw = await this.app.vault.cachedRead(file);
-      const frontmatter = frontmatterBlock(raw);
-      if (!frontmatter.frontmatter.includes(ID)) {
-        if (!frontmatter.exists && /^\uFEFF?---[ \t]*\r?\n/.test(raw) && raw.includes(ID)) {
-          throw Error(`${file.path}: close the frontmatter block before syncing.`);
-        }
-        continue;
-      }
-      let props: Properties;
-      try { props = properties(raw); } catch {
-        throw Error(`${file.path}: fix the YAML properties before syncing.`);
-      }
-      if (props[ACCOUNT] !== account) continue;
-      const id = props[ID];
-      if (typeof id !== "string" || !ULID.test(id)) {
-        throw Error(`${file.path}: the SirajHub item ID is invalid.`);
-      }
+      const link = this.data.links[file.path] ?? this.legacyLink(await this.app.vault.cachedRead(file), file.path);
+      if (link?.account !== account) continue;
+      const { id } = link;
       const paths = found.get(id) ?? [];
       paths.push(file);
       found.set(id, paths);
     }
     return found;
+  }
+
+  private legacyLink(raw: string, path: string): Link | undefined {
+    const frontmatter = frontmatterBlock(raw);
+    if (!frontmatter.frontmatter.includes(ID)) {
+      if (!frontmatter.exists && /^\uFEFF?---[ \t]*\r?\n/.test(raw) && raw.includes(ID)) {
+        throw Error(`${path}: close the frontmatter block before syncing.`);
+      }
+      return;
+    }
+    const props = properties(raw);
+    const id = props[ID];
+    const account = props[ACCOUNT];
+    if (typeof account !== "string") return;
+    if (typeof id !== "string" || !ULID.test(id)) throw Error(`${path}: the SirajHub item ID is invalid.`);
+    return { id, account };
+  }
+
+  private availablePath(base: string) {
+    let path = `${base}.md`;
+    for (let suffix = 2; this.app.vault.getAbstractFileByPath(path) || this.data.links[path]; suffix++) {
+      path = `${base} ${suffix}.md`;
+    }
+    return path;
+  }
+
+  private async migrateLink(file: TFile, link: Link) {
+    const raw = await this.app.vault.read(file);
+    const legacy = this.legacyLink(raw, file.path);
+    const stored = this.data.links[file.path];
+    if ((!stored && !legacy) || [stored, legacy].some((candidate) =>
+      candidate && (candidate.id !== link.id || candidate.account !== link.account))) {
+      throw Error("This note’s SirajHub link changed.");
+    }
+    if (legacy) {
+      this.data.links[file.path] = link;
+      // Persist the replacement before removing the only copy of the legacy link.
+      await this.save();
+      await this.app.vault.process(file, (current) => {
+        if (current !== raw) throw Error("The note changed during sync. Run sync again.");
+        const props = properties(current);
+        delete props[ID];
+        delete props[ACCOUNT];
+        return withProperties(current, props);
+      });
+    }
+    const suffix = new RegExp(` \\(${link.id}\\)(?: \\d+)?$`);
+    if (suffix.test(file.basename)) {
+      const base = file.path.slice(0, -3).replace(suffix, "");
+      await this.app.fileManager.renameFile(file, this.availablePath(base));
+    }
   }
 
   private async ensureFolder(folder: string) {
@@ -176,16 +241,14 @@ export default class SirajSync extends Plugin {
 
   private async importItem(item: Item, account: string, config: Settings["types"][ContentType]) {
     const rules = parseRules(config.properties, item.contentType);
-    const props = { [ID]: item.id, [ACCOUNT]: account, ...initialProperties(item, rules) };
-    await this.ensureFolder(config.folder);
-    const base = `${config.folder}/${safeFilename(item.title)} (${item.id})`;
-    let path = `${base}.md`;
-    for (let suffix = 2; this.app.vault.getAbstractFileByPath(path); suffix++) {
-      path = `${base} ${suffix}.md`;
-    }
-    await this.app.vault.create(path, withProperties("", props));
+    const props = initialProperties(item, rules);
     const { next } = await planItem(item, props, rules, {});
+    await this.ensureFolder(config.folder);
+    const path = this.availablePath(`${config.folder}/${safeFilename(item.title)}`);
+    const file = await this.app.vault.create(path, withBody(withProperties("", props), config.body, item));
+    this.data.links[file.path] = { account, id: item.id };
     this.data.baselines[`${account}/${item.id}`] = next;
+    await this.save();
   }
 
   private async reconcile(
@@ -195,7 +258,8 @@ export default class SirajSync extends Plugin {
     const rules = parseRules(config.properties, item.contentType);
     const raw = await this.app.vault.read(file);
     const local = properties(raw);
-    if (local[ID] !== item.id || local[ACCOUNT] !== account) throw Error("This note’s SirajHub link changed.");
+    const link = this.data.links[file.path];
+    if (link?.id !== item.id || link.account !== account) throw Error("This note’s SirajHub link changed.");
     const key = `${account}/${item.id}`;
     const previous = this.data.baselines[key] ?? {};
     let plan = await planItem(item, local, rules, previous, resolution);
@@ -205,25 +269,24 @@ export default class SirajSync extends Plugin {
       // Avoid sending a stale local snapshot if the note changed while we calculated the plan.
       if (await this.app.vault.read(file) !== raw) throw Error("The note changed during sync. Run sync again.");
       const payload = plan.writes;
-      const updated = await api.patch(item, payload);
+      item = await api.patch(item, payload);
       result.pushed++;
       wrote = true;
-      plan = await planItem(updated, local, rules, previous, resolution, payload);
+      plan = await planItem(item, local, rules, previous, resolution, payload);
     }
 
-    if (Object.keys(plan.pulls).length && this.loaded) {
-      let changed = false;
+    const next = { ...local };
+    for (const [property, value] of Object.entries(plan.pulls)) {
+      if (value == null) delete next[property];
+      else next[property] = value;
+    }
+    const updated = withBody(Object.keys(plan.pulls).length ? withProperties(raw, next) : raw, config.body, item);
+    if (updated !== raw && this.loaded) {
       await this.app.vault.process(file, (current) => {
         if (current !== raw) throw Error("The note changed during sync. Run sync again.");
-        const next = { ...local };
-        for (const [property, value] of Object.entries(plan.pulls)) {
-          if (value == null) delete next[property];
-          else next[property] = value;
-        }
-        changed = true;
-        return withProperties(current, next);
+        return updated;
       });
-      if (changed) result.pulled++;
+      result.pulled++;
     } else if (!wrote && !plan.problems.length) {
       result.unchanged++;
     }
@@ -255,6 +318,7 @@ export default class SirajSync extends Plugin {
         }
         try {
           if (notes.length > 1) throw Error(`More than one note links to this item: ${notes.map((file) => file.path).join(", ")}.`);
+          if (notes[0]) await this.migrateLink(notes[0], { account, id: item.id });
           if (notes[0]) await this.reconcile(api, notes[0], item, account, config, result, resolution);
           else {
             await this.importItem(item, account, config);
@@ -334,8 +398,11 @@ export default class SirajSync extends Plugin {
       }
       const raw = await this.app.vault.read(file);
       const local = properties(raw);
-      if (Object.hasOwn(local, ID) || Object.hasOwn(local, ACCOUNT)) throw Error("This note already has a SirajHub link.");
-      const rules = parseRules(settings.types[type].properties, type);
+      if (this.data.links[path] || Object.hasOwn(local, ID) || Object.hasOwn(local, ACCOUNT)) {
+        throw Error("This note already has a SirajHub link.");
+      }
+      const { properties: mapping, body } = settings.types[type];
+      const rules = parseRules(mapping, type);
       const payload = createPayload(type, local, rules, file.basename);
       const fieldNames = Object.keys(payload).filter((field) => field !== "contentType").join(", ");
       this.confirm("Publish note to SirajHub?",
@@ -344,29 +411,36 @@ export default class SirajSync extends Plugin {
           if (stable(settings) !== stable(current) || file.path !== path || await this.app.vault.read(file) !== raw) {
             throw Error("The note or settings changed. Review the note and run Publish again.");
           }
+          if (this.data.links[file.path]) throw Error("This note already has a SirajHub link.");
           const api = this.api(settings);
           const account = await api.account();
           const item = await api.create(payload);
           const remote = initialProperties(item, rules);
           try {
+            if (this.app.vault.getAbstractFileByPath(file.path) !== file) throw Error("The note was removed.");
+            this.data.links[file.path] = { account, id: item.id };
+            const { next } = await planItem(item, remote, rules, {});
+            this.data.baselines[`${account}/${item.id}`] = next;
+            await this.save();
+          } catch {
+            throw Error(`The item was created in SirajHub (ID ${item.id}), but its link could not be saved. Review it on the site before publishing again.`);
+          }
+          try {
             await this.app.vault.process(file, (content) => {
               const live = properties(content);
               if (Object.hasOwn(live, ID) || Object.hasOwn(live, ACCOUNT)) throw Error("This note is already linked.");
-              const merged = { ...live, [ID]: item.id, [ACCOUNT]: account } as Properties;
+              const merged = { ...live };
               for (const { property, writable } of rules) {
                 // Preserve local edits made during the request and pre-existing values for read-only fields.
                 if (stable(live[property]) !== stable(local[property]) || (!writable && Object.hasOwn(live, property))) continue;
                 if (Object.hasOwn(remote, property)) merged[property] = remote[property];
                 else delete merged[property];
               }
-              return withProperties(content, merged);
+              return withBody(stable(live) === stable(merged) ? content : withProperties(content, merged), body, item);
             });
           } catch {
-            throw Error(`The item was created in SirajHub (ID ${item.id}), but the note could not be linked. Review it on the site before publishing again.`);
+            throw Error(`The item was created and linked, but the note could not be updated. Run sync again. (${item.id})`);
           }
-          const { next } = await planItem(item, remote, rules, {});
-          this.data.baselines[`${account}/${item.id}`] = next;
-          await this.save();
           new Notice("Siraj Sync: note published and linked.");
         }));
     } catch (error) { new Notice(`Siraj Sync: ${message(error)}`, 8000); }
@@ -416,7 +490,7 @@ class SyncSettings extends PluginSettingTab {
         }));
     }
 
-    new Setting(containerEl).setName("Library folders and properties").setHeading();
+    new Setting(containerEl).setName("Library folders and note content").setHeading();
     containerEl.createEl("p", { text: "Clear a folder to skip that type. Use one field = property mapping per line. Fields starting with metadata. are imported from SirajHub. Changes to folders affect new imports; linked notes stay where you put them." });
     for (const type of typeIds) {
       const details = containerEl.createEl("details");
@@ -429,6 +503,13 @@ class SyncSettings extends PluginSettingTab {
         input.inputEl.cols = 32;
         input.setValue(config.properties).onChange((value) => { config.properties = value; });
       });
+      new Setting(details).setName("Note body template")
+        .setDesc("Optional Markdown. Use {{creator}}, {{description}}, or {{metadata.genres}} to insert SirajHub values.")
+        .addTextArea((input) => {
+          input.inputEl.rows = 6;
+          input.inputEl.cols = 32;
+          input.setValue(config.body).onChange((value) => { config.body = value; });
+        });
     }
     const status = containerEl.createEl("p", { attr: { role: "status" } });
     new Setting(containerEl)
@@ -447,6 +528,7 @@ class SyncSettings extends PluginSettingTab {
             try {
               next.types[type].folder = cleanFolder(next.types[type].folder);
               parseRules(next.types[type].properties, type);
+              validateBodyTemplate(next.types[type].body, type);
             } catch (error) { throw Error(`${TYPES[type]}: ${message(error)}`); }
           }
           await this.plugin.updateSettings(next);

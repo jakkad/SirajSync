@@ -23,11 +23,24 @@ pageCount = pages
 metadata.isbn = isbn
 ```
 
-Clear a folder to skip that content type. Folder changes apply to future imports; existing linked files stay where you move them. Keep the generated `sirajhub-id` and `sirajhub-account` properties so the plugin can find a linked note after a move or rename.
+Clear a folder to skip that content type. Folder changes apply to future imports. Move or rename linked notes in Obsidian with Siraj Sync enabled so it can update the stored paths. When an older note syncs, the plugin moves its link into plugin data, removes the two sync properties, and strips the old item ID suffix from its filename.
 
 - Editable fields: `title`, `creator`, `status`, `rating`, `description`, `sourceUrl`, `coverUrl`, `releaseDate`, `externalId`, `notes`, `durationMins`, and `pageCount` (books only). Ratings run from 1 to 7. Status values are `suggestions`, `in_progress`, `finished`, and `archived`.
 - Import fields: `metadata.<field>` (for example, `metadata.genres` or `metadata.seasons`), `contentType`, `subtitle`, `progressPercent`, `progressCurrent`, `progressTotal`, `createdAt`, `updatedAt`, `startedAt`, `finishedAt`, and `lastTouchedAt`. Nested objects are represented as JSON strings.
-- Only mapped properties participate in sync. The note body stays local. If you want to share commentary, use the property mapped to `notes`. Standalone SirajHub note entries, lists, tags, reminders, and attachments are outside this integration.
+- Only mapped properties participate in two-way sync. If you want to share commentary, use the property mapped to `notes`. Standalone SirajHub note entries, lists, tags, reminders, and attachments are outside this integration.
+
+Use **Note body template** under a content type to insert SirajHub fields into a Markdown section in the note body. The template can use fields that have no property mapping.
+
+```markdown
+## About this book
+
+**Author:** {{creator}}
+**Genres:** {{metadata.genres}}
+
+{{description}}
+```
+
+Sync refreshes the generated section with SirajHub values. Write personal notes outside that section. Clear the template to remove the generated section on the next sync.
 
 To create an item from Obsidian, put the Markdown file in a folder mapped to one content type and run **Siraj Sync: Publish current note to SirajHub**. Review the fields in the confirmation. After publishing, the note is linked to the new item. Unlinked notes are never uploaded in bulk.
 

@@ -24,7 +24,7 @@ export type Settings = {
   secret: string;
   interval: number;
   statuses: ItemStatus[];
-  types: Record<ContentType, { folder: string; properties: string }>;
+  types: Record<ContentType, { folder: string; properties: string; body: string }>;
 };
 export type Item = Record<string, unknown> & { id: string; title: string; contentType: ContentType; updatedAt: number };
 export type Properties = Record<string, unknown>;
@@ -46,9 +46,15 @@ export function defaults(): Settings {
   return {
     server: "", secret: "", interval: 0, statuses: [...statusIds],
     types: Object.fromEntries(Object.entries(TYPES).map(([type, label]) => [
-      type, { folder: `SirajHub/${label}`, properties: `${COMMON}\n${EXTRAS[type as ContentType]}` },
+      type, { folder: `SirajHub/${label}`, properties: `${COMMON}\n${EXTRAS[type as ContentType]}`, body: "" },
     ])) as Settings["types"],
   };
+}
+
+function supportsField(field: string, type: ContentType) {
+  return (field !== "pageCount" || type === "book") &&
+    (TEXT.includes(field) || NUMBERS.includes(field) || READ_ONLY.includes(field) ||
+      /^metadata\.[\w-]+(?:\.[\w-]+)*$/.test(field));
 }
 
 export function parseRules(text: string, type: ContentType): Rule[] {
@@ -61,8 +67,7 @@ export function parseRules(text: string, type: ContentType): Rule[] {
     const field = match[1]!;
     const property = match[2]!;
     const writable = TEXT.includes(field) || NUMBERS.includes(field);
-    if ((!writable && !READ_ONLY.includes(field) && !/^metadata\.[\w-]+(?:\.[\w-]+)*$/.test(field)) ||
-        (field === "pageCount" && type !== "book")) {
+    if (!supportsField(field, type)) {
       throw Error(`Unsupported field: ${field}.`);
     }
     if (keys.has(field) || properties.has(property.toLowerCase())) {
@@ -72,6 +77,43 @@ export function parseRules(text: string, type: ContentType): Rule[] {
     properties.add(property.toLowerCase());
     return [{ field, property, writable }];
   });
+}
+
+const bodyStart = "<!-- siraj-sync:body -->";
+const bodyEnd = "<!-- /siraj-sync:body -->";
+const bodyField = /\{\{([^{}\r\n]+)\}\}/g;
+
+export function validateBodyTemplate(template: string, type: ContentType) {
+  for (const [, token] of template.matchAll(bodyField)) {
+    const field = token!.trim();
+    if (!supportsField(field, type)) throw Error(`Unsupported body field: ${field}.`);
+  }
+}
+
+export function renderBody(template: string, item: Item): string {
+  return template.replace(bodyField, (_, token: string) => {
+    const value = valueAt(item, token.trim());
+    return Array.isArray(value) ? value.join(", ") : String(value ?? "");
+  }).replaceAll(bodyStart, "&lt;" + bodyStart.slice(1))
+    .replaceAll(bodyEnd, "&lt;" + bodyEnd.slice(1)).trim();
+}
+
+export function updateBody(body: string, rendered: string, newline: string): string {
+  const start = body.indexOf(bodyStart);
+  const end = body.indexOf(bodyEnd);
+  const block = rendered ? [bodyStart, rendered.replace(/\r?\n/g, newline), bodyEnd].join(newline) : "";
+  if (start === -1 && end === -1) {
+    if (!block) return body;
+    return body + (body ? newline + newline : "") + block;
+  }
+  if (start === -1 || end < start || body.indexOf(bodyStart, start + 1) !== -1 || body.indexOf(bodyEnd, end + 1) !== -1) {
+    throw Error("The Siraj Sync body markers are incomplete or duplicated. Check the note before syncing.");
+  }
+  const separator = newline + newline;
+  const before = body.slice(0, start);
+  const after = body.slice(end + bodyEnd.length);
+  if (block) return before + block + after;
+  return (before.endsWith(separator) ? before.slice(0, -separator.length) : before) + after;
 }
 
 export function serverOrigin(value: string): string {
