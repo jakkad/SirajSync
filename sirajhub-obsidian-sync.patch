@@ -1,0 +1,521 @@
+diff --git a/apps/web/src/lib/api.ts b/apps/web/src/lib/api.ts
+index b292357..307e417 100644
+--- a/apps/web/src/lib/api.ts
++++ b/apps/web/src/lib/api.ts
+@@ -409,6 +409,17 @@ export const tagsApi = {
+   },
+ };
+ 
++export interface ObsidianSyncKey {
++  id: string;
++  createdAt: number;
++}
++
++export const obsidianSyncKeysApi = {
++  list: () => request<{ keys: ObsidianSyncKey[] }>("/api/user/sync-keys"),
++  create: () => request<ObsidianSyncKey & { key: string }>("/api/user/sync-keys", { method: "POST" }),
++  revoke: (id: string) => request<{ ok: true }>(`/api/user/sync-keys/${encodeURIComponent(id)}`, { method: "DELETE" }),
++};
++
+ // ── User API ──────────────────────────────────────────────────────────────────
+ 
+ export interface UserProfile {
+diff --git a/apps/web/src/routes/settings.tsx b/apps/web/src/routes/settings.tsx
+index edca15a..589ce5c 100644
+--- a/apps/web/src/routes/settings.tsx
++++ b/apps/web/src/routes/settings.tsx
+@@ -18,11 +18,11 @@ import {
+   useUserProfile,
+   useUserSettings,
+ } from "../hooks/useUser";
+-import { userApi, type AiPrompts, type AiQueueJob, type InterestProfiles, type InterestWeight, type LabsSettings } from "../lib/api";
++import { obsidianSyncKeysApi, userApi, type ObsidianSyncKey, type AiPrompts, type AiQueueJob, type InterestProfiles, type InterestWeight, type LabsSettings } from "../lib/api";
+ import { CONTENT_TYPES } from "../lib/constants";
+ import { Badge } from "@/components/ui/badge";
+ import { Button } from "@/components/ui/button";
+-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
++import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+ import { Input } from "@/components/ui/input";
+ import { Label } from "@/components/ui/label";
+ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+@@ -526,6 +526,91 @@ function ProfileTab({ profile }: { profile?: { name: string; email: string; pref
+   );
+ }
+ 
++function ObsidianSyncKeysCard() {
++  const [keys, setKeys] = useState<ObsidianSyncKey[] | null>(null);
++  const [issued, setIssued] = useState<{ id: string; key: string } | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [message, setMessage] = useState("");
++
++  useEffect(() => {
++    let active = true;
++    void obsidianSyncKeysApi.list().then(
++      ({ keys }) => { if (active) setKeys(keys); },
++      () => { if (active) setMessage("Could not load sync keys. Reopen this tab to retry."); },
++    );
++    return () => { active = false; };
++  }, []);
++
++  async function change(id?: string) {
++    setBusy(true);
++    setMessage("");
++    try {
++      if (id) {
++        await obsidianSyncKeysApi.revoke(id);
++        setKeys((current) => current?.filter((key) => key.id !== id) ?? []);
++        setIssued((current) => current?.id === id ? null : current);
++        setMessage("Key revoked.");
++      } else {
++        const { key, ...record } = await obsidianSyncKeysApi.create();
++        setKeys((current) => [record, ...(current ?? [])]);
++        setIssued({ id: record.id, key });
++      }
++    } catch (error) {
++      setMessage(error instanceof Error ? error.message : "Could not update sync keys.");
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  async function copy() {
++    if (!issued) return;
++    try {
++      await navigator.clipboard.writeText(issued.key);
++      setMessage("Key copied.");
++    } catch {
++      setMessage("Select the key and copy it manually.");
++    }
++  }
++
++  return (
++    <Card>
++      <CardHeader>
++        <CardTitle>Obsidian sync keys</CardTitle>
++        <CardDescription>Give Siraj Sync access to read, create, and update items in your library.</CardDescription>
++      </CardHeader>
++      <CardContent className="flex flex-col gap-4">
++        {issued && (
++          <div className="flex flex-col gap-2">
++            <Label htmlFor="issued-obsidian-key">New sync key · shown once</Label>
++            <Input id="issued-obsidian-key" value={issued.key} readOnly onFocus={(event) => event.target.select()} />
++            <div className="flex flex-wrap gap-2">
++              <Button variant="outline" onClick={() => void copy()}>Copy key</Button>
++              <Button variant="ghost" onClick={() => { setIssued(null); setMessage(""); }}>Done</Button>
++            </div>
++          </div>
++        )}
++        {keys?.length === 0 && <p className="text-sm text-muted-foreground">No active sync keys.</p>}
++        {!!keys?.length && (
++          <ul className="flex flex-col gap-2">
++            {keys.map((key) => (
++              <li className="flex flex-wrap items-center justify-between gap-2" key={key.id}>
++                <span className="text-sm">Key …{key.id.slice(-6)} · {new Date(key.createdAt).toLocaleString()}</span>
++                <Button size="sm" variant="outline" disabled={busy} aria-label={`Revoke key ending in ${key.id.slice(-6)}`} onClick={() => void change(key.id)}>
++                  Revoke
++                </Button>
++              </li>
++            ))}
++          </ul>
++        )}
++        <p role="status" className="text-sm text-muted-foreground">{message || (!keys ? "Loading sync keys…" : "")}</p>
++      </CardContent>
++      <CardFooter>
++        <Button disabled={!keys || busy || !!issued} onClick={() => void change()}>Generate sync key</Button>
++      </CardFooter>
++    </Card>
++  );
++}
++
+ function ApiKeysTab() {
+   const { data: settings } = useUserSettings();
+   const { mutate: updateKey, isPending } = useUpdateApiKey();
+@@ -564,6 +649,7 @@ function ApiKeysTab() {
+ 
+   return (
+     <div className="grid gap-5">
++      <ObsidianSyncKeysCard />
+       {API_KEY_SERVICES.map((svc) => {
+         const isSet = settings?.[svc.id as keyof typeof settings] === "set";
+         return (
+diff --git a/scripts/smoke-obsidian-sync.mjs b/scripts/smoke-obsidian-sync.mjs
+new file mode 100644
+index 0000000..6208ca8
+--- /dev/null
++++ b/scripts/smoke-obsidian-sync.mjs
+@@ -0,0 +1,70 @@
++import assert from "node:assert/strict";
++import { randomUUID } from "node:crypto";
++
++const origin = new URL(process.env.BASE_URL ?? "http://127.0.0.1:8789");
++if (origin.protocol !== "http:" || !["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname)) {
++  throw Error("Run this smoke test only against a disposable local SirajHub database.");
++}
++
++async function send(path, status, { method = "GET", headers, data } = {}) {
++  const response = await fetch(new URL(path, origin), {
++    method, headers: { "Content-Type": "application/json", ...headers },
++    ...(data !== undefined && { body: JSON.stringify(data) }),
++  });
++  assert.equal(response.status, status, `${method} ${path}`);
++  return { response, body: await response.json() };
++}
++
++async function signUp() {
++  const { response } = await send("/api/auth/sign-up/email", 200, {
++    method: "POST", headers: { Origin: origin.origin },
++    data: { email: `smoke-${randomUUID()}@example.com`, name: "Sync smoke test", password: randomUUID() },
++  });
++  const cookie = response.headers.getSetCookie().map((value) => value.split(";", 1)[0]).join("; ");
++  assert.ok(cookie, "Sign-up created a session");
++  return { Cookie: cookie, Origin: origin.origin };
++}
++
++const first = await signUp();
++const second = await signUp();
++const keyPath = "/api/user/sync-keys";
++await send(keyPath, 401);
++const { body: issued } = await send(keyPath, 201, { method: "POST", headers: first });
++assert.ok(/^srj_sync_[a-f0-9]{64}$/.test(issued.key), "A valid sync key was issued");
++const { body: listed } = await send(keyPath, 200, { headers: first });
++assert.deepEqual(listed.keys, [{ id: issued.id, createdAt: issued.createdAt }]);
++assert.deepEqual((await send(keyPath, 200, { headers: second })).body.keys, []);
++await send(`${keyPath}/${issued.id}`, 404, { method: "DELETE", headers: second });
++
++const key = { Authorization: `Bearer ${issued.key}` };
++await send(keyPath, 403, { headers: key });
++await send("/api/user/export", 403, { headers: key });
++await send("/api/sync/account", 200, { headers: key });
++const listPath = "/api/sync/items";
++const title = `Obsidian sync ${randomUUID()}`;
++const { body: privateItem } = await send("/api/items", 201, {
++  method: "POST", headers: second, data: { title: `Private ${title}`, contentType: "book" },
++});
++const { body: item } = await send("/api/items", 201, {
++  method: "POST", headers: key, data: { title, contentType: "book", rating: 5 },
++});
++const page = (await send(listPath, 200, { headers: key })).body;
++assert.deepEqual(page.items.map(({ id }) => id), [item.id]);
++assert.equal(page.next, null);
++assert.deepEqual((await send(`${listPath}?after=${item.id}`, 200, { headers: key })).body.items, []);
++const path = `/api/items/${item.id}`;
++const patch = (path, status, data, headers = key) => send(path, status, { method: "PATCH", data, headers });
++const match = { ...key, "If-Match": `"${item.updatedAt}"` };
++await patch(`/api/items/${privateItem.id}`, 404, { rating: 1 }, match);
++await patch(path, 428, { rating: 7 });
++await patch(path, 400, { hiddenFromRecommendations: true }, match);
++const { body: edited } = await patch(path, 200, { rating: 7, notes: "From Obsidian" }, match);
++assert.equal(edited.rating, 7);
++assert.equal(edited.notes, "From Obsidian");
++assert.ok(edited.updatedAt > item.updatedAt);
++await patch(path, 412, { rating: 2 }, match);
++assert.equal((await send(listPath, 200, { headers: key })).body.items[0].rating, 7);
++await send(path, 403, { method: "DELETE", headers: key });
++await send(`${keyPath}/${issued.id}`, 200, { method: "DELETE", headers: first });
++await send(listPath, 401, { headers: key });
++console.log("PASS: key creation, scope, account isolation, item round trip, stale writes, revocation");
+diff --git a/worker/src/db/migrations/0014_obsidian_sync_keys.sql b/worker/src/db/migrations/0014_obsidian_sync_keys.sql
+new file mode 100644
+index 0000000..82bb000
+--- /dev/null
++++ b/worker/src/db/migrations/0014_obsidian_sync_keys.sql
+@@ -0,0 +1,8 @@
++CREATE TABLE `obsidian_sync_keys` (
++  `id` text PRIMARY KEY NOT NULL,
++  `user_id` text NOT NULL REFERENCES `user`(`id`) ON DELETE CASCADE,
++  `digest` text NOT NULL UNIQUE,
++  `created_at` integer NOT NULL
++);
++
++CREATE INDEX `idx_obsidian_sync_keys_user` ON `obsidian_sync_keys` (`user_id`);
+diff --git a/worker/src/db/schema.ts b/worker/src/db/schema.ts
+index f4a777c..29571b2 100644
+--- a/worker/src/db/schema.ts
++++ b/worker/src/db/schema.ts
+@@ -18,6 +18,13 @@ export const user = sqliteTable("user", {
+   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+ });
+ 
++export const obsidianSyncKeys = sqliteTable("obsidian_sync_keys", {
++  id: text("id").primaryKey(),
++  userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
++  digest: text("digest").notNull().unique(),
++  createdAt: integer("created_at").notNull(),
++}, (t) => [index("idx_obsidian_sync_keys_user").on(t.userId)]);
++
+ // ── Sessions (managed by Better Auth, Phase 2) ───────────────────────────────
+ export const session = sqliteTable("session", {
+   id: text("id").primaryKey(),
+diff --git a/worker/src/index.ts b/worker/src/index.ts
+index 55a756f..6322ff7 100644
+--- a/worker/src/index.ts
++++ b/worker/src/index.ts
+@@ -12,6 +12,8 @@ import userRouter from "./routes/user";
+ import viewsRouter from "./routes/views";
+ import listsRouter from "./routes/lists";
+ import remindersRouter from "./routes/reminders";
++import syncRouter from "./routes/sync";
++import syncKeysRouter from "./routes/sync-keys";
+ import notesRouter from "./routes/notes";
+ import { processAiQueue } from "./services/ai-queue";
+ import type { Env } from "./types";
+@@ -44,6 +46,8 @@ app.get("/api/health", (c) => {
+ app.use("/api/*", requireAuth);
+ 
+ // ── API routes ────────────────────────────────────────────────────────────────
++app.route("/api/sync", syncRouter);
++app.route("/api/user/sync-keys", syncKeysRouter);
+ app.route("/api/items", itemsRouter);
+ app.route("/api/ingest", ingestRouter);
+ app.route("/api/ai", aiRouter);
+diff --git a/worker/src/lib/sync-keys.ts b/worker/src/lib/sync-keys.ts
+new file mode 100644
+index 0000000..29cd2ca
+--- /dev/null
++++ b/worker/src/lib/sync-keys.ts
+@@ -0,0 +1,41 @@
++const KEY_PREFIX = "srj_sync_";
++
++function hex(bytes: Uint8Array) {
++  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
++}
++
++export function createSyncKey() {
++  return KEY_PREFIX + hex(crypto.getRandomValues(new Uint8Array(32)));
++}
++
++export async function digestSyncKey(key: string) {
++  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key))));
++}
++
++export function isSyncKey(key: string) {
++  return /^srj_sync_[a-f0-9]{64}$/.test(key);
++}
++
++export function canUseSyncKey(method: string, path: string) {
++  if (method === "GET") return path === "/api/sync/account" || path === "/api/sync/items";
++  if (method === "POST") return path === "/api/items";
++  return method === "PATCH" && /^\/api\/items\/[0-9A-HJKMNP-TV-Z]{26}$/.test(path);
++}
++
++const editableText = new Set(["creator", "description", "coverUrl", "releaseDate", "sourceUrl", "externalId", "notes"]);
++const statuses = new Set(["suggestions", "in_progress", "finished", "archived"]);
++
++export function validSyncWrite(body: unknown, creating: boolean) {
++  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
++  const fields = body as Record<string, unknown>;
++  if (!Object.keys(fields).length || (creating && (!fields.title || !fields.contentType))) return false;
++  return Object.entries(fields).every(([field, value]) => {
++    if (field === "title") return typeof value === "string" && !!value.trim();
++    if (field === "contentType") return creating && typeof value === "string";
++    if (field === "status") return typeof value === "string" && statuses.has(value);
++    if (field === "rating" || field === "durationMins" || field === "pageCount") {
++      return value === null || (typeof value === "number" && Number.isSafeInteger(value));
++    }
++    return editableText.has(field) && (value === null || typeof value === "string");
++  });
++}
+diff --git a/worker/src/middleware/auth.ts b/worker/src/middleware/auth.ts
+index 386da97..ef872a2 100644
+--- a/worker/src/middleware/auth.ts
++++ b/worker/src/middleware/auth.ts
+@@ -2,7 +2,12 @@ import { createMiddleware } from "hono/factory";
+ import { createAuth } from "../auth";
+ import type { Env } from "../types";
+ 
+-type Variables = { userId: string };
++import { eq } from "drizzle-orm";
++import { createDb } from "../db/client";
++import { obsidianSyncKeys } from "../db/schema";
++import { canUseSyncKey, digestSyncKey, isSyncKey, validSyncWrite } from "../lib/sync-keys";
++
++type Variables = { userId: string; syncKey?: boolean };
+ 
+ /**
+  * Validates the session cookie / bearer token via Better Auth.
+@@ -13,6 +18,28 @@ export const requireAuth = createMiddleware<{
+   Bindings: Env;
+   Variables: Variables;
+ }>(async (c, next) => {
++  const token = c.req.header("Authorization")?.match(/^Bearer\s+(srj_sync_.*)$/i)?.[1];
++  if (token) {
++    if (!isSyncKey(token)) return c.json({ error: "Invalid sync key" }, 401);
++    if (!canUseSyncKey(c.req.method, c.req.path)) {
++      return c.json({ error: "This endpoint is outside the sync key scope" }, 403);
++    }
++    const db = createDb(c.env.DB);
++    const [key] = await db.select({ userId: obsidianSyncKeys.userId }).from(obsidianSyncKeys)
++      .where(eq(obsidianSyncKeys.digest, await digestSyncKey(token)));
++    if (!key) return c.json({ error: "Invalid or revoked sync key" }, 401);
++    if (c.req.method !== "GET") {
++      const body = await c.req.json<unknown>().catch(() => null);
++      if (!validSyncWrite(body, c.req.method === "POST")) {
++        return c.json({ error: "Invalid sync item fields" }, 400);
++      }
++    }
++    c.set("userId", key.userId);
++    c.set("syncKey", true);
++    await next();
++    return;
++  }
++
+   const auth = createAuth(c.env, c.req.raw);
+   const session = await auth.api.getSession({ headers: c.req.raw.headers });
+ 
+diff --git a/worker/src/routes/items.ts b/worker/src/routes/items.ts
+index 58877e4..ce742af 100644
+--- a/worker/src/routes/items.ts
++++ b/worker/src/routes/items.ts
+@@ -9,7 +9,7 @@ import { getRunAfterFromInterval, processAiQueue, queueAiJob, syncSuggestMetrics
+ import { fetchTMDB } from "../services/metadata/movies";
+ import type { Env } from "../types";
+ 
+-type Variables = { userId: string };
++type Variables = { userId: string; syncKey?: boolean };
+ 
+ const VALID_CONTENT_TYPES = new Set(["book", "movie", "tv", "podcast", "youtube", "article", "tweet"]);
+ const VALID_STATUSES = new Set(["suggestions", "in_progress", "finished", "archived"]);
+@@ -1040,6 +1040,10 @@ router.post("/:id/resync-tv", async (c) => {
+ router.patch("/:id", async (c) => {
+   const userId = c.get("userId");
+   const id = c.req.param("id");
++  const revision = c.req.header("If-Match");
++  if (c.get("syncKey") && (!revision || !/^"\d{1,15}"$/.test(revision))) {
++    return c.json({ error: "An item revision is required" }, 428);
++  }
+   const body = await c.req.json<
+     Partial<{
+       title: string;
+@@ -1110,11 +1114,15 @@ router.patch("/:id", async (c) => {
+       sourceUrl: items.sourceUrl,
+       externalId: items.externalId,
+       contentType: items.contentType,
++      updatedAt: items.updatedAt,
+     })
+     .from(items)
+     .where(and(eq(items.id, id), eq(items.userId, userId)));
+ 
+   if (!existing) return c.json({ error: "Not found" }, 404);
++  if (c.get("syncKey") && revision !== `"${existing.updatedAt}"`) {
++    return c.json({ error: "Item changed in SirajHub. Sync again to review the changes." }, 412);
++  }
+   const effectiveContentType = body.contentType ?? existing.contentType;
+   if (body.pageCount != null && effectiveContentType !== "book") {
+     return c.json({ error: "Page count is only supported for books." }, 400);
+@@ -1125,9 +1133,9 @@ router.patch("/:id", async (c) => {
+     userId,
+     {
+       title: body.title ?? existing.title,
+-      creator: body.creator ?? existing.creator,
+-      sourceUrl: body.sourceUrl ?? existing.sourceUrl,
+-      externalId: body.externalId ?? existing.externalId,
++      creator: "creator" in body ? body.creator : existing.creator,
++      sourceUrl: "sourceUrl" in body ? body.sourceUrl : existing.sourceUrl,
++      externalId: "externalId" in body ? body.externalId : existing.externalId,
+       contentType: body.contentType ?? existing.contentType,
+     },
+     id
+@@ -1142,7 +1150,7 @@ router.patch("/:id", async (c) => {
+     );
+   }
+ 
+-  const now = Date.now();
++  const now = Math.max(Date.now(), existing.updatedAt + 1);
+   const update: Record<string, unknown> = {
+     updatedAt: now,
+     ...buildUpdatePayload(body as Record<string, unknown>, [
+@@ -1201,12 +1209,15 @@ router.patch("/:id", async (c) => {
+     }
+   }
+ 
+-  await db
++  const [written] = await db
+     .update(items)
+     .set(update)
+-    .where(and(eq(items.id, id), eq(items.userId, userId)));
++    .where(and(eq(items.id, id), eq(items.userId, userId),
++      c.get("syncKey") ? eq(items.updatedAt, existing.updatedAt) : undefined))
++    .returning();
++  if (!written) return c.json({ error: "Item changed before the update was saved" }, 412);
+ 
+-  let [updated] = await db.select().from(items).where(eq(items.id, id));
++  let updated = written;
+ 
+   const scoringRelevantKeys = [
+     "title",
+diff --git a/worker/src/routes/sync-keys.ts b/worker/src/routes/sync-keys.ts
+new file mode 100644
+index 0000000..046ed3e
+--- /dev/null
++++ b/worker/src/routes/sync-keys.ts
+@@ -0,0 +1,38 @@
++import { Hono } from "hono";
++import { and, desc, eq } from "drizzle-orm";
++import { ulid } from "ulidx";
++import { createDb } from "../db/client";
++import { obsidianSyncKeys } from "../db/schema";
++import { createSyncKey, digestSyncKey } from "../lib/sync-keys";
++import type { Env } from "../types";
++
++const router = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
++
++router.get("/", async (c) => {
++  const db = createDb(c.env.DB);
++  const keys = await db.select({ id: obsidianSyncKeys.id, createdAt: obsidianSyncKeys.createdAt })
++    .from(obsidianSyncKeys).where(eq(obsidianSyncKeys.userId, c.get("userId")))
++    .orderBy(desc(obsidianSyncKeys.createdAt));
++  return c.json({ keys });
++});
++
++router.post("/", async (c) => {
++  const db = createDb(c.env.DB);
++  const key = createSyncKey();
++  const id = ulid();
++  const createdAt = Date.now();
++  await db.insert(obsidianSyncKeys).values({
++    id, userId: c.get("userId"), digest: await digestSyncKey(key), createdAt,
++  });
++  return c.json({ id, createdAt, key }, 201);
++});
++
++router.delete("/:id", async (c) => {
++  const db = createDb(c.env.DB);
++  const [revoked] = await db.delete(obsidianSyncKeys)
++    .where(and(eq(obsidianSyncKeys.id, c.req.param("id")), eq(obsidianSyncKeys.userId, c.get("userId"))))
++    .returning({ id: obsidianSyncKeys.id });
++  return revoked ? c.json({ ok: true }) : c.json({ error: "Key not found" }, 404);
++});
++
++export default router;
+diff --git a/worker/src/routes/sync.ts b/worker/src/routes/sync.ts
+new file mode 100644
+index 0000000..5a6d94d
+--- /dev/null
++++ b/worker/src/routes/sync.ts
+@@ -0,0 +1,26 @@
++import { Hono } from "hono";
++import { and, asc, eq, gt, getTableColumns } from "drizzle-orm";
++import { createDb } from "../db/client";
++import { items } from "../db/schema";
++import type { Env } from "../types";
++
++const router = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
++const PAGE_SIZE = 100;
++const { userId: _userId, ...columns } = getTableColumns(items);
++
++router.get("/account", (c) => c.json({ accountId: c.get("userId"), protocolVersion: 1 }));
++
++router.get("/items", async (c) => {
++  const after = c.req.query("after");
++  if (after !== undefined && !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(after)) {
++    return c.json({ error: "Invalid cursor" }, 400);
++  }
++  const db = createDb(c.env.DB);
++  const rows = await db.select(columns).from(items)
++    .where(and(eq(items.userId, c.get("userId")), after ? gt(items.id, after) : undefined))
++    .orderBy(asc(items.id)).limit(PAGE_SIZE + 1);
++  const page = rows.slice(0, PAGE_SIZE);
++  return c.json({ items: page, next: rows.length > PAGE_SIZE ? page.at(-1)!.id : null });
++});
++
++export default router;
