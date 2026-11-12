@@ -119,3 +119,29 @@ test("finished dates import as calendar dates and migrate old timestamps", async
   assert.deepEqual((await planItem(item, legacy, dateRules, base)).pulls, { "finished-date": null });
   assert.deepEqual((await planItem(book, date, dateRules, migrated.next)).pulls, {});
 });
+
+test("cover mappings prefer cached files without sending vault links to SirajHub", async () => {
+  const url = "https://covers.example.com/book.png";
+  const cover = `[[SirajHub/Covers/0123456789abcdef/${item.id}.png]]`;
+  const coverRules = parseRules("coverUrl = cover\ncoverImage = cover-image", "book");
+  const online = { ...item, coverUrl: url };
+  const downloaded = { ...online, coverImage: cover };
+  const before = initialProperties(online, coverRules);
+  const baseline = (await planItem(online, before, coverRules, {})).next;
+  assert.deepEqual(initialProperties(downloaded, coverRules), { cover, "cover-image": cover });
+  const migrated = await planItem(downloaded, before, coverRules, baseline);
+  assert.deepEqual(migrated.pulls, { cover, "cover-image": cover });
+  assert.deepEqual(migrated.writes, {});
+
+  const local = { ...before, ...migrated.pulls };
+  const changedUrl = "https://covers.example.com/second.jpg";
+  const remoteChanged = await planItem({ ...downloaded, coverUrl: changedUrl }, local, coverRules, migrated.next);
+  assert.deepEqual(remoteChanged.writes, {});
+  assert.deepEqual(remoteChanged.pulls, {});
+  const missing = await planItem(online, local, coverRules, migrated.next);
+  assert.deepEqual(missing.pulls, { cover: url, "cover-image": null });
+  assert.deepEqual(missing.writes, {});
+  const edited = await planItem(downloaded, { ...local, cover: changedUrl }, coverRules, migrated.next);
+  assert.deepEqual(edited.writes, { coverUrl: changedUrl });
+  assert.throws(() => createPayload("book", local, coverRules, "Book"), /HTTP or HTTPS/);
+});

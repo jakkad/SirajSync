@@ -9,6 +9,8 @@ Siraj Sync brings your SirajHub library into Obsidian as Markdown notes with pro
 3. In Obsidian, go to **Settings → Siraj Sync**. Enter the site origin (e.g. `https://siraj.example.com`) and use **Link…** to create or select a secret with the copied key. Click **Test connection**, then **Save settings**. Obsidian stores the key in [Secret Storage](https://docs.obsidian.md/plugins/guides/secret-storage).
 4. Run **Siraj Sync: Sync now** from the command palette. To sync periodically while Obsidian is open, set a nonzero sync interval.
 
+The progress notice shows how many items sync has checked and which cover it is downloading. It appears immediately for manual sync and after one second for automatic sync. If you dismiss it, run **Siraj Sync: Show sync progress** from the command palette to reopen it.
+
 Under **Statuses to sync**, select one or more statuses and click **Save settings**. All four statuses are selected by default. Sync uses each item's current SirajHub status to decide which notes to import or update. When an item moves to an excluded status, its linked note stays in the vault and sync resumes if the item returns to a selected status. You can still publish an individual note with the **Publish current note to SirajHub** command.
 
 ## Folders and properties
@@ -27,6 +29,8 @@ metadata.isbn = isbn
 Wrap the property name in double brackets to make its text values Obsidian links. For example, `creator = [[author]]` writes `author: "[[Ursula K. Le Guin]]"`. Existing synced values change format on the next sync. Editing a linked value sends the link target text or its alias to SirajHub as plain text. The plugin writes links to note names, and you can create missing target notes from Obsidian.
 
 Add `finishedAt = finished-date` to an existing mapping to import the date from SirajHub. It uses the same `YYYY-MM-DD` date as the SirajHub edit form. In Obsidian, set the property type to **Date** for the calendar picker and date comparisons. New default mappings already include it.
+
+Sync downloads covers for eligible items into `SirajHub/Covers/` inside the vault. It reuses existing files and retries missing ones by default. Turn on **Redownload covers on every sync** to refresh existing files. With `coverUrl = cover`, sync updates the `cover` property to link to the local file. If a local copy is unavailable, it uses the source URL. Existing `coverImage` mappings continue to work as local file links.
 
 Clear a folder to skip that content type. Folder changes apply to future imports. Move or rename linked notes in Obsidian with Siraj Sync enabled so it can update the stored paths. When an older note syncs, the plugin moves its link into plugin data, removes the two sync properties, and strips the old item ID suffix from its filename.
 

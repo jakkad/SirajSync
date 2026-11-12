@@ -3,6 +3,8 @@ import {
   SecretComponent, Setting, stringifyYaml, TFile, TFolder,
 } from "obsidian";
 import { SirajApi } from "./api.ts";
+import { coverExtensions, coverFolder, downloadCover, type CoverExtension } from "./covers.ts";
+import { SyncProgress } from "./progress.ts";
 import {
   ACCOUNT, cleanFolder, createPayload, defaults, ID, initialProperties, isStatus, isType, KEY,
   parseRules, planItem, renderBody, serverOrigin, stable, STATUSES, statusIds, TYPES, ULID, updateBody, validateBodyTemplate,
@@ -15,8 +17,10 @@ type SyncData = {
   baselines: Record<string, Baseline>;
   links: Record<string, Link>;
   managedProperties: Record<string, string[]>;
+  covers: Record<string, CoverExtension>;
 };
 type Report = { created: number; pulled: number; pushed: number; unchanged: number; issues: string[] };
+type CoverSettings = { folder: string; refresh: boolean; progress: SyncProgress };
 const typeIds = Object.keys(TYPES) as ContentType[];
 
 function baselineProperty(mapping: string) {
@@ -79,6 +83,7 @@ export default class SirajSync extends Plugin {
   private loaded = false;
   private lastAutomatic = Date.now();
   private report?: Report;
+  private progress?: SyncProgress;
 
   async onload() {
     const stored = await this.loadData() as Partial<SyncData> | null;
@@ -88,6 +93,7 @@ export default class SirajSync extends Plugin {
       baselines: stored?.baselines ?? {},
       links: stored?.links ?? {},
       managedProperties: stored?.managedProperties ?? {},
+      covers: stored?.covers ?? {},
     };
     for (const type of typeIds) {
       Object.assign(this.data.settings.types[type], stored?.settings?.types?.[type]);
@@ -97,6 +103,14 @@ export default class SirajSync extends Plugin {
     this.registerEvent(this.app.vault.on("delete", (file) => this.moveLinks(file.path)));
     this.addSettingTab(new SyncSettings(this.app, this));
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.sync() });
+    this.addCommand({
+      id: "show-progress", name: "Show sync progress",
+      checkCallback: (checking) => {
+        if (!this.progress) return false;
+        if (!checking) this.progress.show();
+        return true;
+      },
+    });
     this.addCommand({ id: "publish-note", name: "Publish current note to SirajHub", callback: () => void this.publish() });
     this.addCommand({ id: "show-report", name: "Show last sync report", callback: () => this.showReport() });
     this.addCommand({ id: "use-hub-values", name: "Resolve current note using SirajHub values", callback: () => void this.resolve("pull") });
@@ -111,7 +125,10 @@ export default class SirajSync extends Plugin {
     }, 30_000));
   }
 
-  onunload() { this.loaded = false; }
+  onunload() {
+    this.loaded = false;
+    this.progress?.close();
+  }
 
   private save() {
     const snapshot = structuredClone(this.data);
@@ -249,8 +266,50 @@ export default class SirajSync extends Plugin {
     }
   }
 
-  private async importItem(item: Item, account: string, config: Settings["types"][ContentType]) {
+  private async withCover(item: Item, account: string, covers: CoverSettings, result: Report): Promise<Item> {
+    if (typeof item.coverUrl !== "string" || !item.coverUrl.trim()) return { ...item, coverImage: null };
+    const key = `${account}/${item.id}`;
+    const path = (extension: CoverExtension) => `${covers.folder}/${item.id}.${extension}`;
+    const known = this.data.covers[key];
+    const candidates = known && coverExtensions.includes(known) ? [known] : coverExtensions;
+    let file: TFile | null = null;
+    for (const extension of candidates) {
+      const candidate = this.app.vault.getFileByPath(path(extension));
+      if (!candidate?.stat.size) continue;
+      file = candidate;
+      this.data.covers[key] = extension;
+      break;
+    }
+    if (!file || covers.refresh) {
+      covers.progress.update(`Downloading cover for “${item.title}”…`);
+      try {
+        const { extension, data } = await downloadCover(item.coverUrl);
+        if (!this.loaded) return item;
+        await this.ensureFolder(covers.folder);
+        const destination = path(extension);
+        const existing = this.app.vault.getFileByPath(destination);
+        if (existing) {
+          await this.app.vault.modifyBinary(existing, data);
+          file = existing;
+        } else {
+          file = await this.app.vault.createBinary(destination, data);
+        }
+        this.data.covers[key] = extension;
+      } catch (error) {
+        result.issues.push(`${item.title}: ${message(error)}`);
+      } finally {
+        covers.progress.update(`Syncing “${item.title}”…`);
+      }
+    }
+    return { ...item, coverImage: file ? `[[${file.path}]]` : null };
+  }
+
+  private async importItem(
+    item: Item, account: string, config: Settings["types"][ContentType], covers: CoverSettings, result: Report,
+  ) {
     const rules = parseRules(config.properties, item.contentType);
+    item = await this.withCover(item, account, covers, result);
+    if (!this.loaded) return;
     const props = initialProperties(item, rules);
     const { next } = await planItem(item, props, rules, {});
     await this.ensureFolder(config.folder);
@@ -265,7 +324,7 @@ export default class SirajSync extends Plugin {
 
   private async reconcile(
     api: SirajApi, file: TFile, item: Item, account: string, config: Settings["types"][ContentType], result: Report,
-    resolution: Resolution, syncValues: boolean, removeUnmappedProperties: boolean,
+    resolution: Resolution, syncValues: boolean, removeUnmappedProperties: boolean, covers: CoverSettings,
   ) {
     const rules = parseRules(config.properties, item.contentType);
     const key = `${account}/${item.id}`;
@@ -280,22 +339,36 @@ export default class SirajSync extends Plugin {
     const local = properties(raw);
     const link = this.data.links[file.path] ?? this.legacyLink(raw, file.path);
     if (link?.id !== item.id || link.account !== account) throw Error("This note’s SirajHub link changed.");
+    const coverRules = rules.filter(({ field }) => field === "coverUrl" || field === "coverImage");
+    const serverRules = rules.filter((rule) => !coverRules.includes(rule));
     let plan = syncValues
-      ? await planItem(item, local, rules, previous, resolution)
+      ? await planItem(item, local, serverRules, previous, resolution)
       : { writes: {}, pulls: {}, next: { ...previous }, problems: [] };
-    let wrote = false;
+    const payload: Properties = { ...plan.writes };
+    const sourceRules = coverRules.filter(({ field }) => field === "coverUrl");
+    if (syncValues && sourceRules.length) {
+      const { writes } = await planItem(item, local, sourceRules, previous, resolution);
+      Object.assign(payload, writes);
+    }
 
-    if (Object.keys(plan.writes).length && this.loaded) {
+    const wrote = Object.keys(payload).length > 0;
+    if (wrote && this.loaded) {
       // Avoid sending a stale local snapshot if the note changed while we calculated the plan.
       if (await this.app.vault.read(file) !== raw) throw Error("The note changed during sync. Run sync again.");
-      const payload = plan.writes;
       item = await api.patch(item, payload);
       result.pushed++;
-      wrote = true;
-      plan = await planItem(item, local, rules, previous, resolution, payload);
+      plan = await planItem(item, local, serverRules, previous, resolution, payload);
     }
 
     if (!this.loaded) return;
+    if (syncValues) {
+      item = await this.withCover(item, account, covers, result);
+      if (!this.loaded) return;
+      const coverPlan = await planItem(item, local, coverRules, previous, resolution, payload);
+      Object.assign(plan.pulls, coverPlan.pulls);
+      Object.assign(plan.next, coverPlan.next);
+      plan.problems.push(...coverPlan.problems);
+    }
     const next = { ...local };
     for (const property of removed) delete next[property];
     for (const [property, value] of Object.entries(plan.pulls)) {
@@ -328,52 +401,70 @@ export default class SirajSync extends Plugin {
   async sync(automatic = false, only?: TFile, resolution: Resolution = "normal") {
     await this.run(async (settings) => {
       this.lastAutomatic = Date.now();
-      const api = this.api(settings);
-      const account = await api.account();
-      const [items, links] = await Promise.all([api.items(), this.linkedNotes(account)]);
-      const result: Report = { created: 0, pulled: 0, pushed: 0, unchanged: 0, issues: [] };
-      const remoteIds = new Set(items.map(({ id }) => id));
-
-      for (const item of items) {
-        if (!this.loaded) break;
-        const config = settings.types[item.contentType];
-        const notes = links.get(item.id) ?? [];
-        if (only && !notes.includes(only)) continue;
-        const selected = isStatus(item.status) && settings.statuses.includes(item.status);
-        const syncValues = selected && Boolean(config.folder);
-        if (!selected) {
-          if (only) result.issues.push(`${only.path}: the item's SirajHub status is not selected for sync.`);
-        } else if (!config.folder) {
-          if (only) result.issues.push(`${only.path}: sync is disabled for ${TYPES[item.contentType]}.`);
-        }
-        if (!syncValues && (!settings.removeUnmappedProperties || !notes.length)) continue;
-        try {
-          if (notes.length > 1) throw Error(`More than one note links to this item: ${notes.map((file) => file.path).join(", ")}.`);
-          if (notes[0]) {
-            if (syncValues) await this.migrateLink(notes[0], { account, id: item.id });
-            await this.reconcile(api, notes[0], item, account, config, result, resolution, syncValues, settings.removeUnmappedProperties);
-          } else {
-            await this.importItem(item, account, config);
-            result.created++;
-          }
-        } catch (error) {
-          result.issues.push(`${item.title}: ${message(error)}`);
-        }
+      const progress = new SyncProgress(automatic);
+      this.progress = progress;
+      let result: Report;
+      try {
+        result = await this.syncLibrary(settings, progress, only, resolution);
+      } finally {
+        progress.close();
+        this.progress = undefined;
       }
-      for (const [id, files] of links) {
-        if (!remoteIds.has(id) && (!only || files.includes(only))) {
-          result.issues.push(`${files.map((file) => file.path).join(", ")}: item no longer exists in SirajHub; note kept.`);
-        }
-      }
-      if (only && ![...links.values()].some((files) => files.includes(only))) {
-        result.issues.push(`${only.path}: this note isn’t linked to the connected SirajHub account.`);
-      }
-      this.report = result;
-      await this.save();
-      if (!automatic || result.issues.length) {
+      if (this.loaded && (!automatic || progress.shown || result.issues.length)) {
         new Notice(`Siraj Sync: ${this.summary(result)}${result.issues.length ? " Run “Show last sync report” for details." : ""}`, 8000);
       }
     }, automatic);
+  }
+
+  private async syncLibrary(settings: Settings, progress: SyncProgress, only: TFile | undefined, resolution: Resolution) {
+    const api = this.api(settings);
+    const account = await api.account();
+    progress.update("Loading the SirajHub library and checking vault notes…");
+    const [items, links] = await Promise.all([api.items(), this.linkedNotes(account)]);
+    const covers = { folder: await coverFolder(account), refresh: settings.refreshCovers, progress };
+    const result: Report = { created: 0, pulled: 0, pushed: 0, unchanged: 0, issues: [] };
+    const remoteIds = new Set(items.map(({ id }) => id));
+    const targets = only ? items.filter(({ id }) => links.get(id)?.includes(only)) : items;
+
+    for (const [checked, item] of targets.entries()) {
+      if (!this.loaded) break;
+      const config = settings.types[item.contentType];
+      const notes = links.get(item.id) ?? [];
+      const selected = isStatus(item.status) && settings.statuses.includes(item.status);
+      const syncValues = selected && Boolean(config.folder);
+      if (!selected) {
+        if (only) result.issues.push(`${only.path}: the item's SirajHub status is not selected for sync.`);
+      } else if (!config.folder) {
+        if (only) result.issues.push(`${only.path}: sync is disabled for ${TYPES[item.contentType]}.`);
+      }
+      if (!syncValues && (!settings.removeUnmappedProperties || !notes.length)) continue;
+      progress.update(`Syncing “${item.title}”…`, checked, targets.length);
+      try {
+        if (notes.length > 1) throw Error(`More than one note links to this item: ${notes.map((file) => file.path).join(", ")}.`);
+        if (notes[0]) {
+          if (syncValues) await this.migrateLink(notes[0], { account, id: item.id });
+          await this.reconcile(api, notes[0], item, account, config, result, resolution, syncValues, settings.removeUnmappedProperties, covers);
+        } else {
+          await this.importItem(item, account, config, covers, result);
+          result.created++;
+        }
+      } catch (error) {
+        result.issues.push(`${item.title}: ${message(error)}`);
+      }
+    }
+    for (const [id, files] of links) {
+      if (!remoteIds.has(id) && (!only || files.includes(only))) {
+        result.issues.push(`${files.map((file) => file.path).join(", ")}: item no longer exists in SirajHub; note kept.`);
+      }
+    }
+    if (only && ![...links.values()].some((files) => files.includes(only))) {
+      result.issues.push(`${only.path}: this note isn’t linked to the connected SirajHub account.`);
+    }
+    if (!this.loaded) return result;
+    progress.update("Saving sync results…", targets.length, targets.length);
+    this.report = result;
+    await this.save();
+    return result;
   }
 
   private summary(result: Report) {
@@ -510,6 +601,10 @@ class SyncSettings extends PluginSettingTab {
     let minutes = String(draft.interval);
     new Setting(containerEl).setName("Sync interval in minutes").setDesc("Enter 0 for manual sync only. Automatic sync runs while Obsidian is open.")
       .addText((input) => input.setValue(minutes).onChange((value) => { minutes = value; }));
+    new Setting(containerEl).setName("Redownload covers on every sync")
+      .setDesc("Refresh saved cover images. When off, sync downloads a cover only if its local file is missing.")
+      .addToggle((toggle) => toggle.setValue(draft.refreshCovers)
+        .onChange((enabled) => { draft.refreshCovers = enabled; }));
 
     new Setting(containerEl).setName("Statuses to sync").setHeading();
     containerEl.createEl("p", { text: "Select at least one SirajHub status. Items with other statuses are skipped, and their existing notes stay in your vault." });

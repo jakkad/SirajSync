@@ -16,13 +16,14 @@ const TEXT = ["title", "status", "creator", "description", "coverUrl", "releaseD
 const NUMBERS = ["durationMins", "pageCount", "rating"];
 const READ_ONLY = [
   "contentType", "subtitle", "progressPercent", "progressCurrent", "progressTotal",
-  "createdAt", "updatedAt", "startedAt", "finishedAt", "lastTouchedAt",
+  "createdAt", "updatedAt", "startedAt", "finishedAt", "lastTouchedAt", "coverImage",
 ];
 type Rule = { field: string; property: string; writable: boolean; wikilink: boolean };
 export type Settings = {
   server: string;
   secret: string;
   interval: number;
+  refreshCovers: boolean;
   removeUnmappedProperties: boolean;
   statuses: ItemStatus[];
   types: Record<ContentType, { folder: string; properties: string; body: string }>;
@@ -45,7 +46,7 @@ const EXTRAS: Record<ContentType, string> = {
 
 export function defaults(): Settings {
   return {
-    server: "", secret: "", interval: 0, removeUnmappedProperties: false, statuses: [...statusIds],
+    server: "", secret: "", interval: 0, refreshCovers: false, removeUnmappedProperties: false, statuses: [...statusIds],
     types: Object.fromEntries(Object.entries(TYPES).map(([type, label]) => [
       type, { folder: `SirajHub/${label}`, properties: `${COMMON}\n${EXTRAS[type as ContentType]}`, body: "" },
     ])) as Settings["types"],
@@ -200,6 +201,12 @@ function validatedValue(field: string, value: unknown): unknown {
     return value;
   }
   if (value == null || value === "") return null;
+  if (field === "coverUrl") {
+    if (typeof value !== "string" || !/^https?:\/\/\S+$/i.test(value)) {
+      throw Error("coverUrl must be an HTTP or HTTPS image URL.");
+    }
+    return value;
+  }
   if (field === "releaseDate" && value instanceof Date) return value.toISOString().slice(0, 10);
   if (NUMBERS.includes(field)) {
     const min = field === "durationMins" ? 0 : 1;
@@ -225,11 +232,19 @@ function unlinkValue(value: unknown): unknown {
   return match ? (match[2] ?? match[1])!.trim() : value;
 }
 
+function savedCoverLink(value: unknown, id: string) {
+  if (typeof value !== "string") return false;
+  const match = /^\[\[SirajHub\/Covers\/[a-f0-9]{16}\/([0-9A-HJKMNP-TV-Z]{26})\.[a-z0-9]+\]\]$/.exec(value);
+  return match?.[1] === id;
+}
+
+function propertyValue(item: Item, rule: Rule, value: unknown): unknown {
+  if (rule.field === "coverUrl" && typeof item.coverImage === "string" && item.coverImage) return item.coverImage;
+  return rule.wikilink ? linkValue(value) : value;
+}
+
 export function initialProperties(item: Item, rules: Rule[]): Properties {
-  return Object.fromEntries(rules.map(({ field, property, wikilink }) => {
-    const value = valueAt(item, field);
-    return [property, wikilink ? linkValue(value) : value];
-  })
+  return Object.fromEntries(rules.map((rule) => [rule.property, propertyValue(item, rule, valueAt(item, rule.field))])
     .filter(([, value]) => value != null));
 }
 
@@ -251,7 +266,8 @@ export async function planItem(
   const next: Baseline = {};
   const problems: string[] = [];
 
-  await Promise.all(rules.map(async ({ field, property, writable, wikilink }) => {
+  await Promise.all(rules.map(async (rule) => {
+    const { field, property, writable, wikilink } = rule;
     const plainKey = `${field}=${property}`;
     const linkKey = `link:${plainKey}`;
     const key = wikilink ? linkKey : plainKey;
@@ -260,17 +276,20 @@ export async function planItem(
     const remote = valueAt(item, field);
     const localValue = Object.hasOwn(local, property) ? local[property] : null;
     const localDisplay = field === "finishedAt" ? finishedDate(localValue) : localValue;
-    const current = (wikilink || wasLinked) && stable(localDisplay) !== stable(remote) ? unlinkValue(localDisplay) : localDisplay;
+    let current = localDisplay;
+    // The cached file represents the SirajHub URL, and is never sent back to the server.
+    if (field === "coverUrl" && savedCoverLink(localValue, item.id)) current = remote;
+    else if ((wikilink || wasLinked) && stable(localDisplay) !== stable(remote)) current = unlinkValue(localDisplay);
     const [localHash, remoteHash] = await Promise.all([fingerprint(current), fingerprint(remote)]);
     // Older versions stored and hashed finishedAt as a millisecond timestamp.
     const legacyDate = base && field === "finishedAt" && typeof localValue === "number" && localHash !== base;
     const matchesBase = localHash === base || (legacyDate && await fingerprint(localValue) === base);
     if (localHash === remoteHash) {
-      const formatted = wikilink ? linkValue(localDisplay) : current;
+      const formatted = propertyValue(item, rule, field === "coverUrl" || !wikilink ? current : localDisplay);
       if (stable(formatted) !== stable(localValue)) pulls[property] = formatted;
       next[key] = remoteHash;
     } else if (resolution === "pull" || Object.hasOwn(accepted, field) || (base ? matchesBase : !Object.hasOwn(local, property))) {
-      pulls[property] = wikilink ? linkValue(remote) : remote;
+      pulls[property] = propertyValue(item, rule, remote);
       next[key] = remoteHash;
     } else if (writable && (resolution === "push" || (base && remoteHash === base))) {
       try { writes[field] = validatedValue(field, current); }
